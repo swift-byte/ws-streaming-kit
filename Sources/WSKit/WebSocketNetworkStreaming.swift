@@ -104,6 +104,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		timer = Task { [weak self] in
 			try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
 			if Task.isCancelled { return }
+			// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
+			// с нашим teardown и мог перебить close-код .goingAway
+			outputContinuation.onTermination = nil
 			outputContinuation.finish(throwing: NetworkStreamingError.timeout)
 			delegateContinuation.finish(throwing: NetworkStreamingError.timeout)
 			await self?.cancel(generation: currentGeneration, closeCode: .goingAway)
@@ -180,10 +183,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) -> Task<Void, Never> {
 		let reader = Task<Void, Never> { [weak self] in
+			var didInvalidate = false
 			do {
 				while Task.isCancelled == false {
 					let message = try await task.receive()
-					await self?.invalidate(generation: generation)
+					if didInvalidate == false {
+						didInvalidate = true
+						await self?.invalidate(generation: generation)
+					}
 					switch message {
 					case .string(let text):
 						Logger.assistant.error(S("We expect binary data here"))
@@ -217,9 +224,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 			// Финиш стрима — только после того, как читатель доставил хвост
 			// сообщений: иначе close-фрейм обгоняет данные и последние сообщения
-			// теряются. Читатель обязан проснуться после закрытия сокета; если
-			// платформа не разбудила receive(), дожимаем сокет по дедлайну —
-			// стрим не должен зависать
+			// теряются. Если платформа не разбудила receive() после закрытия,
+			// дожимаем сокет по дедлайну. Это толчок, а не жёсткая граница:
+			// receive(), зависший на уже закрытом сокете, дедлайн не разбудит
 			func drainOutput() async {
 				guard let reader else { return }
 				let deadline = Task { [weak self] in
@@ -268,11 +275,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		request.httpShouldHandleCookies = false
 
 		// Слияние вместо замещения: свои куки перекрывают одноимённые из
-		// shared-стоража, остальные из стоража сохраняются. Оговорка: для wss://
-		// cookies(for:) может не отдавать secure-куки, т.к. схема не https
+		// shared-стоража, остальные из стоража сохраняются. Схема нормализуется
+		// (ws→http, wss→https), чтобы матчинг стоража и secure-куки работали
 		var merged = [String: HTTPCookie]()
 
-		for cookie in session.configuration.httpCookieStorage?.cookies(for: url) ?? [] {
+		for cookie in session.configuration.httpCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [] {
 			merged[cookie.name] = cookie
 		}
 
@@ -290,6 +297,16 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		for (headerField, headerValue) in cookieHeaders {
 			request.setValue(headerValue, forHTTPHeaderField: headerField)
 		}
+	}
+
+	private func cookieMatchURL(for url: URL) -> URL {
+		guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+		switch components.scheme?.lowercased() {
+		case "ws": components.scheme = "http"
+		case "wss": components.scheme = "https"
+		default: break
+		}
+		return components.url ?? url
 	}
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {

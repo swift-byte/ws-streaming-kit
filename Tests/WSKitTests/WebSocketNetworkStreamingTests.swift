@@ -13,6 +13,26 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	private let wsBase = "ws://127.0.0.1:8901"
 	private let silentTCP = "ws://127.0.0.1:8902"
 
+	// Shared-сторадж — процесс-глобальный (на Darwin ещё и переживает процесс),
+	// а corelibs подставляет его содержимое даже при httpShouldHandleCookies = false.
+	// Чистим безусловно, чтобы мусор одного теста не выглядел регрессией другого
+	override func setUp() {
+		super.setUp()
+		Self.purgeLocalCookies()
+	}
+
+	override func tearDown() {
+		Self.purgeLocalCookies()
+		super.tearDown()
+	}
+
+	private static func purgeLocalCookies() {
+		let storage = HTTPCookieStorage.shared
+		for cookie in storage.cookies ?? [] where cookie.domain.contains("127.0.0.1") {
+			storage.deleteCookie(cookie)
+		}
+	}
+
 	// MARK: - Helpers
 
 	private func makeStreaming(
@@ -375,6 +395,34 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(result.events, [.connected, .received(Data("hello".utf8))])
 	}
 
+	func testTimeoutClosesSocketWithGoingAway() async throws {
+		// Регрессия N4: onTermination с cancel(.normalClosure) не должен
+		// перебивать close-код .goingAway из таймера
+		let ws = await makeStreaming(timeout: 2)
+		let stream = try await openStream(ws, path: "/connect-then-silent")
+		let result = await drain(stream, deadline: 6)
+		guard case .timeout? = result.thrown as? NetworkStreamingError else {
+			return XCTFail("Ожидали .timeout, получили \(String(describing: result.thrown))")
+		}
+
+		try await Task.sleep(nanoseconds: 300_000_000)
+		let probe = await makeStreaming(timeout: 5)
+		let probeStream = try await openStream(probe, path: "/lastclose")
+		let probeResult = await drain(probeStream, deadline: 5)
+		let codes = probeResult.events.compactMap { event -> String? in
+			guard case .received(let data) = event else { return nil }
+			return String(decoding: data, as: UTF8.self)
+		}
+		#if canImport(FoundationNetworking)
+		// corelibs + libcurl вовсе не отправляют close-фрейм при cancel(with:) —
+		// сервер видит обрыв без кода (замерено: close_code = None). Проверка
+		// самого кода возможна только на Darwin
+		XCTAssertEqual(codes, ["0"], "Ожидали обрыв без close-фрейма, получили: \(codes)")
+		#else
+		XCTAssertEqual(codes, ["1001"], "Таймаут должен закрывать сокет кодом goingAway (1001)")
+		#endif
+	}
+
 	func testSharedStorageCookiesAreMergedAndManualWins() async throws {
 		// Слияние: куки из shared-стоража сохраняются, одноимённые
 		// перекрываются значениями из CookieStorage
@@ -383,10 +431,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let extra = HTTPCookie(properties: [.name: "extra", .value: "zzz", .domain: "127.0.0.1", .path: "/"])!
 		shared.setCookie(stale)
 		shared.setCookie(extra)
-		defer {
-			shared.deleteCookie(stale)
-			shared.deleteCookie(extra)
-		}
 
 		let ws = await makeStreaming(timeout: 10, cookies: [.session: "abc123"])
 		let stream = try await openStream(ws, path: "/cookie")

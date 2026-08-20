@@ -1,5 +1,7 @@
 import asyncio, websockets
 
+LAST_CLOSE = {}
+
 async def handler(ws):
     path = ws.request.path
     try:
@@ -47,6 +49,16 @@ async def handler(ws):
         elif path == "/burst-close":
             for i in range(5):
                 await ws.send(bytes([i]))
+            await ws.close(code=1000)
+        elif path == "/connect-then-silent":
+            try:
+                async for _ in ws:
+                    pass
+            finally:
+                LAST_CLOSE["code"] = ws.close_code
+        elif path == "/lastclose":
+            await ws.send(str(LAST_CLOSE.get("code") or 0).encode())
+            await asyncio.sleep(0.3)
             await ws.close(code=1000)
         elif path == "/silent":
             await asyncio.sleep(30)
