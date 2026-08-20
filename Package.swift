@@ -4,6 +4,7 @@ import PackageDescription
 let package = Package(
 	name: "WSKit",
 	platforms: [
+		.iOS(.v15),
 		.macOS(.v12)
 	],
 	targets: [
