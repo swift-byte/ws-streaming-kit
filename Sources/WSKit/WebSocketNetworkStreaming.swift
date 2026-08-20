@@ -31,6 +31,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private let handshakeCookieStorage: HTTPCookieStorage?
 
 	private var generation = 0
+	private var isEstablishing = false
 	private var supersededGenerations: Set<Int> = []
 	private var timeoutArbitration = TimeoutArbitration.pending
 	private var webSocketTask: URLSessionWebSocketTask?
@@ -50,14 +51,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	) {
 		self.kidsURLSession = kidsURLSession
 		self.cookieStorage = cookieStorage
-		// Верхняя граница клампа — защита умножения на 1e9 от переполнения
+		// Нижняя граница спасает UInt64-конверсию от отрицательного значения
+		// (иначе трап); верхняя — санитарный предел, до переполнения ей далеко
 		self.timeout = min(max(1, timeout ?? 15), 3_600)
 
 		let configuration = URLSessionConfiguration.default
 		configuration.httpCookieStorage = .shared
-		// Авто-обработка кук на запросах отключена (см. addCookies),
-		// поэтому acceptPolicy на эту сессию фактически не влияет
-		configuration.httpCookieAcceptPolicy = .always
 		handshakeCookieStorage = configuration.httpCookieStorage
 		session = URLSession(
 			configuration: configuration,
@@ -68,6 +67,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Deinit
 
+	// Continuations финиширует connectTask (обе ветви do/catch); deinit ссылок
+	// на них не имеет. Инвариант: внутри цикла connectTask нет ранних return
 	deinit {
 		webSocketTask?.cancel(with: .normalClosure, reason: nil)
 		inputTask?.cancel()
@@ -81,6 +82,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - NetworkStreaming
 
+	/// Устанавливает соединение и возвращает стрим событий.
+	/// - Каждому вызову нужен свежий inputStream: AsyncStream одноразов и
+	///   single-consumer, повторная передача делит данные недетерминированно.
+	/// - До .connected inputStream не потребляется; при отказе на этой фазе он
+	///   освобождается, продюсеру приходит onTermination.
+	/// - badURL — единственный отказ без teardown: действующий стрим сохраняется.
 	func establishStream(
 		endpoint: String,
 		headers: [String: String],
@@ -91,11 +98,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 
 		// Маркер вытеснения: проигравшее поколение получит CancellationError,
-		// явный cancel() остаётся тихим во всех фазах. Set, а не слот:
-		// реконнект-шторм не должен затирать непотреблённые маркеры.
-		// Маркеры пустых эпох (нечего было вытеснять) выпалываются по возрасту
-		supersededGenerations.insert(generation)
-		supersededGenerations = supersededGenerations.filter { generation &- $0 < 64 }
+		// явный cancel() остаётся тихим во всех фазах. Set, а не слот, и маркер
+		// ставится только когда есть кого вытеснять — протухших маркеров и
+		// возрастных окон не существует
+		if connectTask != nil || isEstablishing {
+			supersededGenerations.insert(generation)
+		}
 		await cancel()
 		let currentGeneration = generation
 
@@ -113,7 +121,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			request.setValue(value, forHTTPHeaderField: key)
 		}
 
+		isEstablishing = true
 		await addCookies(to: &request, for: url)
+		isEstablishing = false
 
 		guard generation == currentGeneration else {
 			// Пока собирали куки, поколение сдвинулось. Причину различаем по
@@ -221,10 +231,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
-		guard requested == generation else { return false }
-		guard timeoutArbitration == .pending else {
-			return timeoutArbitration == .firstMessage
-		}
+		// Вызывается один раз на поколение по построению: isFirstMessage
+		// локален единственному читателю — повторного арбитража не существует
+		guard requested == generation, timeoutArbitration == .pending else { return false }
 		timeoutArbitration = .firstMessage
 		timer?.cancel()
 		timer = nil
@@ -263,7 +272,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					try await task.send(.data(data))
 				} catch {
 					sendFailed = true
-					Logger.assistant.error(S("WebSocket input send failed; discarding remaining input"))
+					Logger.assistant.error(S("WebSocket input send failed; closing connection"))
+					// Молчаливый полуживой стрим хуже разрыва: закрываем сокет,
+					// потребитель получит терминальное событие через didComplete
+					task.cancel(with: .goingAway, reason: nil)
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
@@ -272,21 +284,41 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
-	@discardableResult
 	private func createOutputTask(
 		generation: Int,
 		task: URLSessionWebSocketTask,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
-	) -> Task<Void, Never>? {
+	) -> (reader: Task<Void, Never>, done: AsyncStream<Void>)? {
 		// Хоп отменённой connectTask всё равно исполняется: без guard'а поздний
 		// вызов пересоздал бы задачи после teardown или затёр слоты нового
 		// поколения, оставив его живой inputTask без ссылки
 		guard generation == self.generation else { return nil }
+		let (done, doneContinuation) = AsyncStream<Void>.makeStream()
 		let reader = Task<Void, Never> { [weak self] in
+			// Сигнал завершения — от самого читателя: ожидание в drainOutput
+			// становится отменяемым, промежуточный waiter не нужен
+			defer { doneContinuation.finish() }
 			var isFirstMessage = true
+			var warnedTextFrame = false
 			do {
 				while Task.isCancelled == false {
 					let message = try await task.receive()
+					let payload: Data?
+					switch message {
+					case .string(let text):
+						if warnedTextFrame == false {
+							warnedTextFrame = true
+							Logger.assistant.error(S("We expect binary data here"))
+						}
+						payload = text.data(using: .utf8)
+					case .data(let data):
+						payload = data
+					@unknown default:
+						payload = nil
+					}
+					// Арбитраж — по доставляемому байту: кадр, который нечем
+					// отдать потребителю, таймер не гасит
+					guard let payload else { continue }
 					if isFirstMessage {
 						isFirstMessage = false
 						// Арбитраж «первый байт против таймаута» — одна точка
@@ -299,17 +331,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 							return
 						}
 					}
-					switch message {
-					case .string(let text):
-						Logger.assistant.error(S("We expect binary data here"))
-						if let data = text.data(using: .utf8) {
-							outputContinuation.yield(.received(data))
-						}
-					case .data(let data):
-						outputContinuation.yield(.received(data))
-					@unknown default:
-						break
-					}
+					outputContinuation.yield(.received(payload))
 				}
 			} catch {
 				// Терминальная ошибка чтения: завершение стрима — за connectTask,
@@ -317,7 +339,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			}
 		}
 		outputTask = reader
-		return reader
+		return (reader, done)
 	}
 
 	private func createCheckConnectTask(
@@ -329,31 +351,23 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	) {
 		connectTask = Task { [weak self] in
 			var reader: Task<Void, Never>?
+			var readerDone: AsyncStream<Void>?
 
-			// Финиш стрима — только после того, как читатель доставил хвост
-			// сообщений: иначе close-фрейм обгоняет данные и последние сообщения
-			// теряются. Ожидание ограничено: reader.value гоняется против
-			// дедлайна через одноразовый сигнал — платформа, не разбудившая
-			// receive() на закрытом сокете, больше не подвешивает потребителя.
-			// Цена патологии — возможная потеря хвоста и связка waiter/reader/
-			// task, живущая до конца процесса (value не реагирует на отмену
-			// ожидающего); ограниченная утечка против вечного зависания
+			// Финиш стрима — только после доставки хвоста читателем. Ожидание
+			// ограничено гонкой «сигнал завершения читателя против дедлайна»:
+			// обе ветви группы отменяемы, группа не зависает. Патология
+			// (receive() не проснулся на закрытом сокете) оставляет висеть
+			// только сам читатель — минимально возможная цена
 			func drainOutput() async {
-				guard let reader else { return }
-				let (signal, signalContinuation) = AsyncStream<Void>.makeStream()
-				let waiter = Task {
-					await reader.value
-					signalContinuation.yield(())
-					signalContinuation.finish()
+				guard let readerDone else { return }
+				await withTaskGroup(of: Void.self) { group in
+					group.addTask { for await _ in readerDone {} }
+					group.addTask {
+						try? await Task.sleep(nanoseconds: Self.drainGraceNanoseconds)
+					}
+					await group.next()
+					group.cancelAll()
 				}
-				let deadline = Task {
-					try? await Task.sleep(nanoseconds: Self.drainGraceNanoseconds)
-					signalContinuation.finish()
-				}
-				var iterator = signal.makeAsyncIterator()
-				_ = await iterator.next()
-				waiter.cancel()
-				deadline.cancel()
 			}
 
 			do {
@@ -370,15 +384,18 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						) == true else {
 							continue
 						}
-						reader = await self?.createOutputTask(
+						guard let created = await self?.createOutputTask(
 							generation: generation,
 							task: task,
 							outputContinuation: outputContinuation
-						) ?? nil
-						// Отказ означает teardown в окне хопа: ранний return
-						// подвесил бы continuation, которую может дочитывать
-						// потребитель, — ждём штатного финиша через delegateStream
-						guard reader != nil else { continue }
+						) ?? nil else {
+							// Отказ означает teardown в окне хопа: ранний return
+							// подвесил бы continuation, которую может дочитывать
+							// потребитель, — ждём штатного финиша через delegateStream
+							continue
+						}
+						reader = created.reader
+						readerDone = created.done
 						await self?.createInputTask(
 							generation: generation,
 							task: task,
@@ -427,11 +444,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Зарезервированные имена не берутся из shared вовсе: чужая кука
 		// хост-приложения не должна молча подменять авторизацию SDK.
 		// Одноимённые из стоража упорядочены по специфичности path —
-		// длинный path перекрывает короткий, а не произвол перечисления
+		// длинный path перекрывает короткий; порядок тотальный (при равной
+		// длине — лексикографический), sort в Swift нестабилен
 		let reservedNames = Set(Cookies.allCases.map(\.rawValue))
 		let storedCookies = (handshakeCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [])
 			.filter { reservedNames.contains($0.name) == false }
-			.sorted { $0.path.count < $1.path.count }
+			.sorted { ($0.path.count, $0.path) < ($1.path.count, $1.path) }
 		for cookie in storedCookies {
 			merged[cookie.name] = cookie
 		}

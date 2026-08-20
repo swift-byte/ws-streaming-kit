@@ -367,6 +367,18 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Integration: таймаут
 
+	func testInvalidateDisarmsHandshakeTimeout() async throws {
+		// invalidate() снимает единственную страховку: после него зависшее
+		// рукопожатие не должно завершаться самотёком
+		let ws = await makeStreaming(timeout: 3)
+		let stream = try await openStream(ws, path: "/silent")
+		await ws.invalidate()
+		let result = await drain(stream, deadline: 6)
+		XCTAssertFalse(result.completed, "Таймер снят — стрим не должен завершиться сам")
+		XCTAssertNil(result.thrown)
+		await ws.cancel()
+	}
+
 	func testTimeoutFiresWhenHandshakeNeverCompletes() async throws {
 		let ws = await makeStreaming(timeout: 2)
 		let (input, inputCont) = makeInput()
