@@ -67,19 +67,17 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		func markTimeout() { timedOut = true }
 	}
 
-	private actor StreamReader {
-		private var iterator: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.AsyncIterator
+	/// Обёртка одного потребителя: next() никогда не вызывается конкурентно
+	/// (это контракт AsyncThrowingStream), поэтому unchecked-Sendable безопасен
+	private final class StreamReader: @unchecked Sendable {
+		private nonisolated(unsafe) var iterator: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.AsyncIterator
 
 		init(_ stream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>) {
 			iterator = stream.makeAsyncIterator()
 		}
 
 		func next() async throws -> NetworkStreamingOutputEvent? {
-			// Мутирующий async на isolated-свойстве запрещён — копируем локально
-			var localIterator = iterator
-			let value = try await localIterator.next()
-			iterator = localIterator
-			return value
+			try await iterator.next()
 		}
 	}
 
@@ -502,8 +500,9 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let (inputB, contB) = makeInput()
 		contB.finish()
 
+		let racingEndpoint = wsBase + "/silent"
 		async let firstStream = ws.establishStream(
-			endpoint: wsBase + "/silent", headers: [:], inputStream: inputA
+			endpoint: racingEndpoint, headers: [:], inputStream: inputA
 		)
 		try await Task.sleep(nanoseconds: 50_000_000)
 		let streamB = try await ws.establishStream(
@@ -520,6 +519,74 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let readerB = StreamReader(streamB)
 		let firstB = try await readerB.next()
 		XCTAssertEqual(firstB, .connected, "Победившее поколение должно жить")
+		await ws.cancel()
+	}
+
+	func testCancelDuringCookieCollectionAbortsEstablish() async throws {
+		// Отмена в окне await addCookies не должна теряться: раньше сокет
+		// открывался уже после cancel() и никем не закрывался
+		let storage = CookieStorage()
+		await storage.setArtificialDelay(nanoseconds: 300_000_000)
+		let ws = WebSocketNetworkStreaming(
+			kidsURLSession: KidsURLSession(),
+			cookieStorage: storage,
+			timeout: 10
+		)
+		let (input, inputCont) = makeInput()
+		inputCont.finish()
+
+		let cancelledEndpoint = wsBase + "/silent"
+		async let pendingStream = ws.establishStream(
+			endpoint: cancelledEndpoint, headers: [:], inputStream: input
+		)
+		try await Task.sleep(nanoseconds: 100_000_000)
+		await ws.cancel()
+
+		let stream = try await pendingStream
+		let result = await drain(stream, deadline: 3)
+		XCTAssertTrue(result.completed)
+		XCTAssertTrue(result.events.isEmpty, "Сокет не должен открываться после cancel()")
+		XCTAssertTrue(result.thrown is CancellationError,
+			"Ожидали CancellationError, получили \(String(describing: result.thrown))")
+	}
+
+	func testSupersededActiveStreamThrowsCancellation() async throws {
+		// Контракт вытеснения един для всех фаз: живой стрим при замене
+		// получает CancellationError, а не тихий finish
+		let ws = await makeStreaming(timeout: 10)
+		let stream1 = try await openStream(ws, path: "/silent")
+		let reader1 = StreamReader(stream1)
+		let first = try await reader1.next()
+		XCTAssertEqual(first, .connected, "Сокет первого поколения должен подняться")
+
+		let stream2 = try await openStream(ws, path: "/silent")
+
+		enum Outcome: Sendable { case finished, event, cancellation, other(String), timedOut }
+		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
+			group.addTask {
+				do {
+					return try await reader1.next() == nil ? .finished : .event
+				} catch is CancellationError {
+					return .cancellation
+				} catch {
+					return .other(String(describing: error))
+				}
+			}
+			group.addTask {
+				try? await Task.sleep(nanoseconds: 3_000_000_000)
+				return .timedOut
+			}
+			let winner = try await group.next() ?? .timedOut
+			group.cancelAll()
+			return winner
+		}
+		guard case .cancellation = outcome else {
+			return XCTFail("Ожидали CancellationError у вытесненного стрима, получили \(outcome)")
+		}
+
+		let reader2 = StreamReader(stream2)
+		let second = try await reader2.next()
+		XCTAssertEqual(second, .connected, "Победившее поколение должно жить")
 		await ws.cancel()
 	}
 
