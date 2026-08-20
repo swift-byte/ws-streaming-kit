@@ -10,7 +10,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private static let inputTerminator = Data([0x31])
 	// Запас на медленные среды: 0.5с force-закрывал сокет посреди доставки
 	// хвоста (замерено на iOS-симуляторе, 4/5 сообщений). В happy path
-	// дедлайн снимается сразу после дренажа — цена увеличения нулевая
+	// дедлайн снимается сразу после дренажа — цена увеличения нулевая.
+	// Это граница пробуждения читателя, не доставки: receive(), зависший
+	// на уже закрытом сокете, дедлайн не разбудит
 	private static let drainGraceNanoseconds: UInt64 = 3_000_000_000
 
 	private let kidsURLSession: KidsURLSession
@@ -29,6 +31,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Init
 
+	/// - Parameter timeout: секунды ожидания первого входящего сообщения;
+	///   значение клампится в диапазон 0...3600.
 	init(
 		kidsURLSession: KidsURLSession,
 		cookieStorage: CookieStorage,
@@ -76,7 +80,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		await cancel()
 		generation &+= 1
 		let currentGeneration = generation
-		didReceiveFirstMessage = false
 
 		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
 		let (delegateStream, delegateContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
@@ -101,6 +104,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			return outputStream
 		}
 
+		didReceiveFirstMessage = false
 		let delegate = WebSocketNetworkStreamingDelegate(continuation: delegateContinuation)
 		let task = session.webSocketTask(with: request)
 		webSocketTask = task
@@ -112,16 +116,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		timer = Task { [weak self] in
 			try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
 			if Task.isCancelled { return }
-			// Решение «таймаут против первого байта» сериализовано на акторе:
-			// иначе пробуждение таймера гонялось бы с invalidate читателя, и
-			// потребитель мог получить .timeout при уже принятом сообщении
-			guard await self?.fireTimeout(generation: currentGeneration) == true else { return }
-			// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
-			// с нашим teardown и мог перебить close-код .goingAway
-			outputContinuation.onTermination = nil
-			outputContinuation.finish(throwing: NetworkStreamingError.timeout)
-			delegateContinuation.finish(throwing: NetworkStreamingError.timeout)
-			await self?.cancel(generation: currentGeneration, closeCode: .goingAway)
+			// Проверка «был ли первый байт» и финиш — одним изолированным
+			// шагом: разнесённые check и act оставляли окно, где .timeout
+			// перебивал уже принятое сообщение
+			await self?.fireTimeout(
+				generation: currentGeneration,
+				outputContinuation: outputContinuation,
+				delegateContinuation: delegateContinuation
+			)
 		}
 
 		createCheckConnectTask(
@@ -142,7 +144,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	/// Останавливает таймер таймаута.
 	func invalidate() {
-		didReceiveFirstMessage = true
 		timer?.cancel()
 		timer = nil
 	}
@@ -177,9 +178,18 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		timer = nil
 	}
 
-	private func fireTimeout(generation requested: Int) -> Bool {
-		guard requested == generation, didReceiveFirstMessage == false else { return false }
-		return true
+	private func fireTimeout(
+		generation requested: Int,
+		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
+		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
+	) {
+		guard requested == generation, didReceiveFirstMessage == false else { return }
+		// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
+		// с нашим teardown и мог перебить close-код .goingAway
+		outputContinuation.onTermination = nil
+		outputContinuation.finish(throwing: NetworkStreamingError.timeout)
+		delegateContinuation.finish(throwing: NetworkStreamingError.timeout)
+		cancel(generation: requested, closeCode: .goingAway)
 	}
 
 	private func createInputTask(
@@ -210,10 +220,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			do {
 				while Task.isCancelled == false {
 					let message = try await task.receive()
-					if didInvalidate == false {
-						didInvalidate = true
-						await self?.invalidate(generation: generation)
-					}
 					switch message {
 					case .string(let text):
 						Logger.assistant.error(S("We expect binary data here"))
@@ -224,6 +230,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						outputContinuation.yield(.received(data))
 					@unknown default:
 						continue
+					}
+					// Первый байт: yield выше арбитража с таймером — принятое
+					// сообщение не теряется, даже если таймаут выиграет границу
+					// (тогда потребитель получит данные, затем .timeout)
+					if didInvalidate == false {
+						didInvalidate = true
+						await self?.invalidate(generation: generation)
 					}
 				}
 			} catch {
@@ -399,9 +412,10 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		}
 		if error.domain == NSPOSIXErrorDomain && error.code == Int(POSIXErrorCode.ENOTCONN.rawValue) {
 			// Сокет уже закрыт к моменту completion (POSIX 57) — штатный финал
-			// гонки с close-фреймом, а не ошибка: код закрытия, если был,
-			// приходит через didCloseWith. Ветка из исходной версии файла —
-			// она кодировала реальное поведение Darwin (замечено на macOS CI)
+			// гонки с close-фреймом, а не ошибка. Возникает и когда peer
+			// прислал close(1000), а CFNetwork потерял колбэк didCloseWith
+			// (замерено на macOS CI). Истинные обрывы приходят NSURLError-кодами
+			// (-1005/-1001) и остаются ошибками. Ветка из исходной версии файла
 			continuation.finish()
 			return
 		}
