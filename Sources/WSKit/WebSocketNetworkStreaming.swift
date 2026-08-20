@@ -11,6 +11,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		case pending
 		case firstMessage
 		case timedOut
+		case cancelled
 	}
 
 	// MARK: - Private Properties
@@ -167,6 +168,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
 	) {
 		guard requested == generation else { return }
+		// Терминальное состояние арбитража: после отмены ни поздний таймер,
+		// ни поздний первый байт «выиграть» не могут — иначе на границе
+		// истечения потребитель, сам вызвавший cancel(), мог получить ложный
+		// .timeout. Уже принятые исходы не затираем
+		if timeoutArbitration == .pending {
+			timeoutArbitration = .cancelled
+		}
 		webSocketTask?.cancel(with: closeCode, reason: nil)
 		webSocketTask = nil
 		inputTask?.cancel()
