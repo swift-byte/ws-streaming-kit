@@ -150,6 +150,21 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Unit: Cookies
 
+	func testInsecureSchemeRejectedForNonLoopbackHost() async throws {
+		// Даунгрейд wss→ws вне loopback уводил бы auth-куки открытым текстом
+		let ws = await makeStreaming(timeout: 5)
+		let (input, inputCont) = makeInput()
+		inputCont.finish()
+		do {
+			_ = try await ws.establishStream(
+				endpoint: "ws://example.com/socket", headers: [:], inputStream: input
+			)
+			XCTFail("Ожидали badURL для незащищённой схемы вне loopback")
+		} catch let error as URLError {
+			XCTAssertEqual(error.code, .badURL)
+		}
+	}
+
 	func testCreateCookieBuildsCookie() async throws {
 		let ws = await makeStreaming()
 		let url = URL(string: "ws://example.com/path")!
