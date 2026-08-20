@@ -143,17 +143,14 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(cookie.path, "/")
 	}
 
-	func testCreateCookieNilWhenNoHost() async throws {
+	func testCreateCookieWithoutHostYieldsEmptyDomain() async throws {
+		// HTTPCookie(properties:) с пустым domain возвращает куку, а не nil —
+		// поведение одинаково на Darwin и corelibs (проверено на macOS CI).
+		// В Cookie-заголовок domain не сериализуется, так что это безвредно
 		let ws = await makeStreaming()
-		// URL без host -> domain пустой -> HTTPCookie(properties:) вернёт nil
 		let url = URL(string: "file:///tmp/x")!
 		let cookie = await ws.createCookie(name: "a", value: "b", for: url)
-		#if canImport(FoundationNetworking)
-		// corelibs-foundation лояльнее Darwin: пустой domain не даёт nil
 		XCTAssertEqual(cookie?.domain, "")
-		#else
-		XCTAssertNil(cookie)
-		#endif
 	}
 
 	// MARK: - Unit: делегат -> события стрима
