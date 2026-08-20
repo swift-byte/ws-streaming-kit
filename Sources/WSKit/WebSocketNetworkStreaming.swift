@@ -18,18 +18,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		case pending
 		case firstMessage
 		case timedOut
-		case cancelled
 	}
 
 	// MARK: - Private Properties
 
 	private static let inputTerminator = Data([0x31])
-	// Запас на медленные среды: 0.5с force-закрывал сокет посреди доставки
-	// хвоста (замерено на iOS-симуляторе, 4/5 сообщений). В happy path
-	// дедлайн снимается сразу; полные 3с платятся лишь в патологии
-	// незавершившегося читателя — терминальное событие тогда ждёт грейс.
-	// Это граница ожидания дренажа: по её истечении стрим финиширует
-	// без читателя
+	private static let reservedCookieNames = Set(Cookies.allCases.map(\.rawValue))
+	// Граница ожидания дренажа: по истечении стрим финиширует без читателя.
+	// 0.5с резали хвост на медленном симуляторе (4/5 сообщений); в happy
+	// path дедлайн снимается сразу
 	private static let drainGraceNanoseconds: UInt64 = 3_000_000_000
 
 	private let kidsURLSession: KidsURLSession
@@ -59,7 +56,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		self.kidsURLSession = kidsURLSession
 		self.cookieStorage = cookieStorage
 		// Нижняя граница спасает UInt64-конверсию от отрицательного значения
-		// (иначе трап); верхняя — санитарный предел, до переполнения ей далеко
+		// (иначе трап); верхняя — санитарный предел
 		self.timeout = min(max(1, timeout ?? 15), 3_600)
 
 		let configuration = URLSessionConfiguration.default
@@ -167,12 +164,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			)
 		}
 
-		createCheckConnectTask(
+		createConnectTask(
 			generation: currentGeneration,
 			lifecycleToken: lifecycleToken,
 			task: task,
 			inputStream: inputStream,
-			with: delegateStream,
+			delegateStream: delegateStream,
 			outputContinuation: outputContinuation
 		)
 
@@ -197,22 +194,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// Тело обязано оставаться синхронным (без await): establishStream
 	// полагается на неразрывность «пометка токена → teardown → чтение
 	// поколения» внутри своей изоляции.
-	// closeCode — замеренная доставка до сервера: iOS отдаёт 1001 (и голый
-	// путь, и наш), macOS — всегда 1006 (дефект платформы: и без отмены
-	// читателя, и с висящим receive), Linux — недетерминирован (0/1001).
-	// На целевой платформе код работает — параметр не мёртвый вес
+	// closeCode — доставка замерена: iOS 1001, macOS всегда 1006 (дефект
+	// платформы), Linux недетерминирован (0/1001) — на целевой iOS работает
 	private func cancel(
 		generation requested: Int,
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
 	) {
 		guard requested == generation else { return }
-		// Терминальное состояние арбитража: после отмены ни поздний таймер,
-		// ни поздний первый байт «выиграть» не могут — иначе на границе
-		// истечения потребитель, сам вызвавший cancel(), мог получить ложный
-		// .timeout. Уже принятые исходы не затираем
-		if timeoutArbitration == .pending {
-			timeoutArbitration = .cancelled
-		}
 		webSocketTask?.cancel(with: closeCode, reason: nil)
 		webSocketTask = nil
 		inputTask?.cancel()
@@ -242,6 +230,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return true
 	}
 
+	/// Изоляционный шлюз: connectTask читает флаг токена снаружи изоляции,
+	/// а дисциплина @unchecked требует все обращения вести через актора.
 	private func isSuperseded(_ token: LifecycleToken) -> Bool {
 		token.superseded
 	}
@@ -358,12 +348,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return (reader, done)
 	}
 
-	private func createCheckConnectTask(
+	private func createConnectTask(
 		generation: Int,
 		lifecycleToken: LifecycleToken,
 		task: URLSessionWebSocketTask,
 		inputStream: AsyncStream<Data>,
-		with delegateStream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
+		delegateStream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		connectTask = Task { [weak self] in
@@ -390,11 +380,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			do {
 				for try await event in delegateStream {
 					if case .connected = event, reader == nil {
-						// .connected выдаётся изолированно, одним шагом с проверкой
-						// поколения: спуриозного connected для мёртвого поколения
-						// не существует; teardown после выдачи — легитимная
-						// последовательность connected→cancelled. Reader создаётся
-						// после yield — иначе .received мог бы обогнать .connected
+						// .connected выдаётся одним изолированным шагом с проверкой
+						// поколения; reader создаётся после yield, иначе .received
+						// мог бы обогнать .connected
 						guard await self?.yieldConnectedIfCurrent(
 							generation: generation,
 							outputContinuation: outputContinuation
@@ -463,9 +451,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Одноимённые из стоража упорядочены по специфичности path —
 		// длинный path перекрывает короткий; порядок тотальный (при равной
 		// длине — лексикографический), sort в Swift нестабилен
-		let reservedNames = Set(Cookies.allCases.map(\.rawValue))
 		let storedCookies = (handshakeCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [])
-			.filter { reservedNames.contains($0.name) == false }
+			.filter { Self.reservedCookieNames.contains($0.name) == false }
 			.sorted { ($0.path.count, $0.path) < ($1.path.count, $1.path) }
 		for cookie in storedCookies {
 			merged[cookie.name] = cookie
@@ -570,12 +557,10 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			return
 		}
 		if error.domain == NSPOSIXErrorDomain && error.code == Int(POSIXErrorCode.ENOTCONN.rawValue) {
-			// Сокет уже закрыт к моменту completion (POSIX 57) — финал гонки
-			// с close-фреймом (ветка из исходной версии файла). CFNetwork может
-			// потерять колбэк didCloseWith безотносительно кода закрытия
-			// (замерено для 1000 на macOS CI), поэтому код восстанавливаем из
-			// самой задачи — abnormal close не схлопывается в чистый финиш.
-			// Истинные обрывы приходят NSURLError-кодами (-1005/-1001)
+			// POSIX 57: сокет закрыт к моменту completion — финал гонки с
+			// close-фреймом (ветка из исходной версии файла). didCloseWith
+			// теряется безотносительно кода (замерено), код восстанавливаем
+			// из задачи. Истинные обрывы приходят NSURLError-кодами
 			if let closeError = recoveredCloseError(from: task) {
 				continuation.finish(throwing: closeError)
 				return
