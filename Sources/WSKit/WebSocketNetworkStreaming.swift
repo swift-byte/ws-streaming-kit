@@ -145,7 +145,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		webSocketTask = nil
 		inputTask?.cancel()
 		inputTask = nil
-		outputTask?.cancel()
+		// Читателя swift-отменой не трогаем: cancellation-handler асинхронного
+		// receive() на Darwin делает плоский task.cancel() и срывает
+		// graceful-close (сервер видит 1006 вместо кода). Читатель выйдет сам:
+		// закрытый сокет роняет receive()
 		outputTask = nil
 		connectTask?.cancel()
 		connectTask = nil
