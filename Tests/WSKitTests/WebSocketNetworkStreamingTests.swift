@@ -292,7 +292,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testInputForwardedAndTerminatorAppendedOnInputFinish() async throws {
-		let ws = await makeStreaming(timeout: 10)
+		let ws = await makeStreaming(timeout: 15)
 		let (input, inputCont) = makeInput()
 		let stream = try await openStream(ws, path: "/sink", input: input)
 
@@ -300,7 +300,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		inputCont.yield(Data([0xBE, 0xEF]))
 		inputCont.finish() // конец ввода -> ожидаем терминатор 0x31
 
-		let result = await drain(stream, deadline: 8)
+		let result = await drain(stream, deadline: 25)
 		XCTAssertTrue(result.completed)
 		XCTAssertNil(result.thrown)
 		let summaries = result.events.compactMap { event -> String? in
@@ -323,7 +323,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		for _ in 0..<3 {
 			let ws = await makeStreaming(timeout: 10)
 			let stream = try await openStream(ws, path: "/burst-close")
-			let result = await drain(stream, deadline: 6)
+			let result = await drain(stream, deadline: 20)
 			XCTAssertTrue(result.completed)
 			XCTAssertNil(result.thrown)
 			XCTAssertEqual(result.events.first, .connected)
@@ -386,10 +386,11 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testFirstMessageInvalidatesTimeout() async throws {
-		// Сообщение на 0.3с, затем тишина 3.5с при timeout=2: таймер обязан погаснуть
-		let ws = await makeStreaming(timeout: 2)
+		// Сообщение на 0.3с после коннекта, затем тишина 6с при timeout=4:
+		// таймер обязан погаснуть первым сообщением
+		let ws = await makeStreaming(timeout: 4)
 		let stream = try await openStream(ws, path: "/msg-then-silent")
-		let result = await drain(stream, deadline: 7)
+		let result = await drain(stream, deadline: 20)
 		XCTAssertTrue(result.completed)
 		XCTAssertNil(result.thrown, "Таймаут не должен сработать после первого сообщения")
 		XCTAssertEqual(result.events, [.connected, .received(Data("hello".utf8))])
@@ -529,7 +530,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		try await Task.sleep(nanoseconds: 400_000_000)
 
 		let stream2 = try await openStream(ws, path: "/push-after-3")
-		let result = await drain(stream2, deadline: 8)
+		let result = await drain(stream2, deadline: 15)
 		XCTAssertTrue(result.completed, "Второй коннект должен дожить до сообщения и закрытия")
 		XCTAssertNil(result.thrown)
 		XCTAssertEqual(result.events, [.connected, .received(Data("late".utf8))],

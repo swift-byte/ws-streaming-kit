@@ -8,7 +8,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// MARK: - Private Properties
 
 	private static let inputTerminator = Data([0x31])
-	private static let drainGraceNanoseconds: UInt64 = 500_000_000
+	// Запас на медленные среды: 0.5с force-закрывал сокет посреди доставки
+	// хвоста (замерено на iOS-симуляторе, 4/5 сообщений). В happy path
+	// дедлайн снимается сразу после дренажа — цена увеличения нулевая
+	private static let drainGraceNanoseconds: UInt64 = 3_000_000_000
 
 	private let kidsURLSession: KidsURLSession
 	private let cookieStorage: CookieStorage

@@ -41,7 +41,7 @@ async def handler(ws):
         elif path == "/msg-then-silent":
             await asyncio.sleep(0.3)
             await ws.send(b"hello")
-            await asyncio.sleep(3.5)
+            await asyncio.sleep(6)
             await ws.close(code=1000)
         elif path == "/push-after-3":
             await asyncio.sleep(3.2)
