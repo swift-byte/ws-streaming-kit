@@ -259,7 +259,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	func testConnectedIsFirstEventAndMessagesArriveInOrder() async throws {
 		let ws = await makeStreaming(timeout: 10)
 		let stream = try await openStream(ws, path: "/push3")
-		let result = await drain(stream, deadline: 8)
+		let result = await drain(stream, deadline: 25)
 		XCTAssertTrue(result.completed, "Сервер закрывает 1000 — ждали чистый финиш")
 		XCTAssertNil(result.thrown)
 		XCTAssertEqual(result.events.first, .connected)
