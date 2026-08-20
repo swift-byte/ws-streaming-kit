@@ -18,6 +18,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		case pending
 		case firstMessage
 		case timedOut
+		case disarmed
 	}
 
 	// MARK: - Private Properties
@@ -185,6 +186,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// Останавливает таймер таймаута текущего поколения. Снимает единственную
 	/// страховку от зависшего рукопожатия: дальше дедлайнами управляет вызывающий.
 	func invalidate() {
+		// Коммит разоружения — в том же изолированном шаге: отмена одного лишь
+		// хэндла оставляла окно в один хоп, где уже проснувшийся таймер
+		// добегал до fireTimeout и рвал стрим после явного invalidate()
+		if timeoutArbitration == .pending {
+			timeoutArbitration = .disarmed
+		}
 		timer?.cancel()
 		timer = nil
 	}
@@ -201,10 +208,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
 	) {
 		guard requested == generation else { return }
-		webSocketTask?.cancel(with: closeCode, reason: nil)
-		webSocketTask = nil
+		// Отмена ввода — до разрыва сокета: inflight-send иначе падал от
+		// разрыва раньше, чем задача видела отмену, и штатный teardown
+		// эскалировался как сбой аплинка
 		inputTask?.cancel()
 		inputTask = nil
+		webSocketTask?.cancel(with: closeCode, reason: nil)
+		webSocketTask = nil
 		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
@@ -237,9 +247,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
-		// Вызывается один раз на поколение по построению: isFirstMessage
-		// локален единственному читателю — повторного арбитража не существует
-		guard requested == generation, timeoutArbitration == .pending else { return false }
+		// Байт принимается из любого состояния, кроме проигранного арбитража:
+		// .disarmed означает «страховка снята», а не «стрим мёртв»
+		guard requested == generation, timeoutArbitration != .timedOut else { return false }
 		timeoutArbitration = .firstMessage
 		timer?.cancel()
 		timer = nil
@@ -264,7 +274,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func createInputTask(
 		generation: Int,
 		task: URLSessionWebSocketTask,
-		inputStream: AsyncStream<Data>
+		inputStream: AsyncStream<Data>,
+		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		guard generation == self.generation else { return }
 		// detached: тело не трогает актора, а Task {} с наследованием изоляции
@@ -277,10 +288,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				do {
 					try await task.send(.data(data))
 				} catch {
+					// Штатный teardown: сокет рвётся раньше, чем send видит
+					// отмену — это не сбой аплинка
+					guard Task.isCancelled == false else { return }
 					sendFailed = true
-					Logger.assistant.error(S("WebSocket input send failed; closing connection"))
-					// Молчаливый полуживой стрим хуже разрыва: закрываем сокет,
-					// потребитель получит терминальное событие через didComplete
+					Logger.assistant.error(S("WebSocket input send failed"))
+					// Причина фиксируется до отмены сокета (паттерн fireTimeout):
+					// гонка didClose/didComplete не подменит семантику, потребитель
+					// получит транспортную ошибку, а не «сервер договорил»
+					delegateContinuation.finish(throwing: NetworkStreamingError.nsError(error as NSError))
 					task.cancel(with: .goingAway, reason: nil)
 				}
 			}
@@ -404,7 +420,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						await self?.createInputTask(
 							generation: generation,
 							task: task,
-							inputStream: inputStream
+							inputStream: inputStream,
+							delegateContinuation: delegateContinuation
 						)
 					}
 				}
