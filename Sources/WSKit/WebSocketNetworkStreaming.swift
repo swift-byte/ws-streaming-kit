@@ -17,8 +17,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private let cookieStorage: CookieStorage
 	private let timeout: Int
 	private let session: URLSession
+	private let handshakeCookieStorage: HTTPCookieStorage?
 
 	private var generation = 0
+	private var didReceiveFirstMessage = false
 	private var webSocketTask: URLSessionWebSocketTask?
 	private var outputTask: Task<Void, Never>?
 	private var inputTask: Task<Void, Never>?
@@ -41,6 +43,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Авто-обработка кук на запросах отключена (см. addCookies),
 		// поэтому acceptPolicy на эту сессию фактически не влияет
 		configuration.httpCookieAcceptPolicy = .always
+		handshakeCookieStorage = configuration.httpCookieStorage
 		session = URLSession(
 			configuration: configuration,
 			delegate: kidsURLSession,
@@ -73,6 +76,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		await cancel()
 		generation &+= 1
 		let currentGeneration = generation
+		didReceiveFirstMessage = false
 
 		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
 		let (delegateStream, delegateContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
@@ -103,10 +107,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		task.delegate = delegate
 		task.resume()
 
-		let timeoutSeconds = UInt64(max(0, timeout))
+		// Кламп сверху — защита умножения на 1e9 от переполнения UInt64
+		let timeoutSeconds = UInt64(min(max(0, timeout), 3_600))
 		timer = Task { [weak self] in
 			try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
 			if Task.isCancelled { return }
+			// Решение «таймаут против первого байта» сериализовано на акторе:
+			// иначе пробуждение таймера гонялось бы с invalidate читателя, и
+			// потребитель мог получить .timeout при уже принятом сообщении
+			guard await self?.fireTimeout(generation: currentGeneration) == true else { return }
 			// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
 			// с нашим teardown и мог перебить close-код .goingAway
 			outputContinuation.onTermination = nil
@@ -133,15 +142,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	/// Останавливает таймер таймаута.
 	func invalidate() {
+		didReceiveFirstMessage = true
 		timer?.cancel()
 		timer = nil
 	}
 
 	// MARK: - Private Methods
 
-	// closeCode — best effort: на практике сервер его не получает ни на одной
-	// платформе (Linux — обрыв без close-фрейма, Darwin — 1006; замерено CI,
-	// в т.ч. без отмены читателя)
+	// closeCode — замеренная доставка до сервера: iOS отдаёт 1001 (и голый
+	// путь, и наш), macOS — всегда 1006 (дефект платформы: и без отмены
+	// читателя, и с висящим receive), Linux — недетерминирован (0/1001).
+	// На целевой платформе код работает — параметр не мёртвый вес
 	private func cancel(
 		generation requested: Int,
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
@@ -161,8 +172,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	private func invalidate(generation requested: Int) {
 		guard requested == generation else { return }
+		didReceiveFirstMessage = true
 		timer?.cancel()
 		timer = nil
+	}
+
+	private func fireTimeout(generation requested: Int) -> Bool {
+		guard requested == generation, didReceiveFirstMessage == false else { return false }
+		return true
 	}
 
 	private func createInputTask(
@@ -281,11 +298,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		request.httpShouldHandleCookies = false
 
 		// Слияние вместо замещения: свои куки перекрывают одноимённые из
-		// shared-стоража, остальные из стоража сохраняются. Схема нормализуется
-		// (ws→http, wss→https), чтобы матчинг стоража и secure-куки работали
+		// shared-стоража, остальные сохраняются. Ключ — имя, намеренно без
+		// path: path-scoped дубликат положил бы протухшее значение рядом со
+		// свежим. Схема нормализуется (ws→http, wss→https), чтобы матчинг
+		// стоража и secure-куки работали
 		var merged = [String: HTTPCookie]()
 
-		for cookie in session.configuration.httpCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [] {
+		for cookie in handshakeCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [] {
 			merged[cookie.name] = cookie
 		}
 

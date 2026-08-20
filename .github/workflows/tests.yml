@@ -78,10 +78,12 @@ jobs:
         run: |
           set -o pipefail
           SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{f=1; next} f && NF {print $1; exit}')
-          echo "scheme: $SCHEME"
+          DEVICE=$(xcrun simctl list devices available | awk -F'(' '/iPhone/{gsub(/^ +| +$/,"",$1); print $1; exit}')
+          DEVICE=${DEVICE:-iPhone 16}
+          echo "scheme: $SCHEME | device: $DEVICE"
           xcodebuild test \
             -scheme "$SCHEME" \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
             2>&1 | tee ios-test.log | grep -E "Test Suite|Executed|close-code|error:" | tail -60
 
       - name: Logs on failure
