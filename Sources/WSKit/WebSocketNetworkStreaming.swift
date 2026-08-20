@@ -41,7 +41,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// MARK: - Init
 
 	/// - Parameter timeout: секунды ожидания первого входящего сообщения;
-	///   значение клампится в диапазон 0...3600.
+	///   значения вне 1...3600 клампятся к границам.
 	init(
 		kidsURLSession: KidsURLSession,
 		cookieStorage: CookieStorage,
@@ -50,7 +50,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		self.kidsURLSession = kidsURLSession
 		self.cookieStorage = cookieStorage
 		// Верхняя граница клампа — защита умножения на 1e9 от переполнения
-		self.timeout = min(max(0, timeout ?? 15), 3_600)
+		self.timeout = min(max(1, timeout ?? 15), 3_600)
 
 		let configuration = URLSessionConfiguration.default
 		configuration.httpCookieStorage = .shared
@@ -91,6 +91,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		generation &+= 1
 		let currentGeneration = generation
 
+		// Буфер выходного стрима unbounded: потребитель голосового стрима
+		// обязан поспевать, backpressure не применяется намеренно
 		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
 		let (delegateStream, delegateContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
 
@@ -151,7 +153,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		cancel(generation: generation)
 	}
 
-	/// Останавливает таймер таймаута.
+	/// Останавливает таймер таймаута. Снимает единственную страховку от
+	/// зависшего рукопожатия: дальше дедлайнами управляет вызывающий.
 	func invalidate() {
 		timer?.cancel()
 		timer = nil
@@ -214,9 +217,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	private func createInputTask(
+		generation: Int,
 		task: URLSessionWebSocketTask,
 		inputStream: AsyncStream<Data>
 	) {
+		guard generation == self.generation else { return }
 		// detached: тело не трогает актора, а Task {} с наследованием изоляции
 		// на части компиляторов неявно захватывает self — незавершающийся
 		// inputStream удерживал бы актора от deinit
@@ -235,7 +240,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		generation: Int,
 		task: URLSessionWebSocketTask,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
-	) -> Task<Void, Never> {
+	) -> Task<Void, Never>? {
+		// Хоп отменённой connectTask всё равно исполняется: без guard'а поздний
+		// вызов пересоздал бы задачи после teardown или затёр слоты нового
+		// поколения, оставив его живой inputTask без ссылки
+		guard generation == self.generation else { return nil }
 		let reader = Task<Void, Never> { [weak self] in
 			var isFirstMessage = true
 			do {
@@ -308,8 +317,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 							generation: generation,
 							task: task,
 							outputContinuation: outputContinuation
-						)
+						) ?? nil
+						// Отказ означает teardown в окне хопа: ранний return
+						// подвесил бы continuation, которую может дочитывать
+						// потребитель, — ждём штатного финиша через delegateStream
+						guard reader != nil else { continue }
 						await self?.createInputTask(
+							generation: generation,
 							task: task,
 							inputStream: inputStream
 						)
@@ -330,6 +344,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// MARK: - Cookies
 
 	func addCookies(to request: inout URLRequest, for url: URL) async {
+		// Куки прикрепляются к переданному endpoint как есть: он SDK-внутренний
+		// и доверенный. Cookie-заголовок вызывающего перетирается намеренно.
 		// Авто-обработку отключаем: иначе URLSession может перетереть собранный
 		// вручную Cookie значениями из shared-стоража. ВАЖНО: это отключает и
 		// сохранение Set-Cookie из ответа на handshake — если бэк ротирует куки
@@ -356,7 +372,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		guard merged.isEmpty == false else { return }
 
-		let cookieHeaders = HTTPCookie.requestHeaderFields(with: Array(merged.values))
+		let sortedCookies = merged.values.sorted { $0.name < $1.name }
+		let cookieHeaders = HTTPCookie.requestHeaderFields(with: sortedCookies)
 
 		for (headerField, headerValue) in cookieHeaders {
 			request.setValue(headerValue, forHTTPHeaderField: headerField)
@@ -454,6 +471,9 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			return
 		}
 		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
+			// Маппинг из референсной реализации — унаследованный контракт SDK:
+			// потребители различают исходы по этим кейсам, менять только
+			// синхронно с вызывающим кодом
 			continuation.finish(throwing: NetworkStreamingError.timeout)
 			return
 		}
