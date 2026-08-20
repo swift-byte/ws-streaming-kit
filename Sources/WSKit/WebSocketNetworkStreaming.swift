@@ -378,6 +378,14 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			continuation.finish()
 			return
 		}
+		if error.domain == NSPOSIXErrorDomain && error.code == Int(POSIXErrorCode.ENOTCONN.rawValue) {
+			// Сокет уже закрыт к моменту completion (POSIX 57) — штатный финал
+			// гонки с close-фреймом, а не ошибка: код закрытия, если был,
+			// приходит через didCloseWith. Ветка из исходной версии файла —
+			// она кодировала реальное поведение Darwin (замечено на macOS CI)
+			continuation.finish()
+			return
+		}
 		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
 			continuation.finish(throwing: NetworkStreamingError.timeout)
 			return
