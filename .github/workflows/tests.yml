@@ -77,8 +77,10 @@ jobs:
       - name: Run tests on iOS Simulator
         run: |
           set -o pipefail
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{f=1; next} f && NF {print $1; exit}')
+          echo "scheme: $SCHEME"
           xcodebuild test \
-            -scheme WSKit \
+            -scheme "$SCHEME" \
             -destination 'platform=iOS Simulator,name=iPhone 16' \
             2>&1 | tee ios-test.log | grep -E "Test Suite|Executed|close-code|error:" | tail -60
 
