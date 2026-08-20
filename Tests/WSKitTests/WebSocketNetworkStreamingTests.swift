@@ -440,8 +440,8 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 			return XCTFail("Ожидали .timeout, получили \(String(describing: result.thrown))")
 		}
 
-		// ws должен пережить отправку close-фрейма: ранний deinit делает
-		// invalidateAndCancel() и рвёт соединение до того, как фрейм улетит
+		// ws должен пережить отправку close-фрейма: деинициализация до
+		// подтверждения доставки исказила бы замер
 		try await Task.sleep(nanoseconds: 300_000_000)
 		let observed = try await readLastCloseCode()
 		print("close-code baseline=\(baseline) observed=\(observed)")
@@ -523,8 +523,9 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testCancelDuringCookieCollectionAbortsEstablish() async throws {
-		// Отмена в окне await addCookies не должна теряться: раньше сокет
-		// открывался уже после cancel() и никем не закрывался
+		// Отмена в окне await addCookies не должна теряться (раньше сокет
+		// открывался уже после cancel()), а её исход един со всеми фазами:
+		// явная отмена — тихий finish, CancellationError — только вытеснение
 		let storage = CookieStorage()
 		await storage.setArtificialDelay(nanoseconds: 300_000_000)
 		let ws = WebSocketNetworkStreaming(
@@ -546,8 +547,8 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let result = await drain(stream, deadline: 3)
 		XCTAssertTrue(result.completed)
 		XCTAssertTrue(result.events.isEmpty, "Сокет не должен открываться после cancel()")
-		XCTAssertTrue(result.thrown is CancellationError,
-			"Ожидали CancellationError, получили \(String(describing: result.thrown))")
+		XCTAssertNil(result.thrown,
+			"Явная отмена тиха во всех фазах; получили \(String(describing: result.thrown))")
 	}
 
 	func testSupersededActiveStreamThrowsCancellation() async throws {
