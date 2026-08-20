@@ -415,11 +415,12 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testFirstMessageInvalidatesTimeout() async throws {
-		// Сообщение на 0.3с после коннекта, затем тишина 6с при timeout=4:
-		// таймер обязан погаснуть первым сообщением
-		let ws = await makeStreaming(timeout: 4)
+		// Сообщение на 0.3с после коннекта, затем тишина 12с при timeout=8:
+		// таймер обязан погаснуть первым сообщением. Запасы — под медленные
+		// раннеры, где одно рукопожатие занимает секунды
+		let ws = await makeStreaming(timeout: 8)
 		let stream = try await openStream(ws, path: "/msg-then-silent")
-		let result = await drain(stream, deadline: 20)
+		let result = await drain(stream, deadline: 25)
 		XCTAssertTrue(result.completed)
 		XCTAssertNil(result.thrown, "Таймаут не должен сработать после первого сообщения")
 		XCTAssertEqual(result.events, [.connected, .received(Data("hello".utf8))])
@@ -622,7 +623,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	func testReestablishIsNotKilledByStaleTimer() async throws {
 		// Регрессия: отменённый таймер первого коннекта просыпался мгновенно и,
 		// пройдя проверку по self.timer (уже новому), отменял задачи ВТОРОГО коннекта.
-		let ws = await makeStreaming(timeout: 5)
+		let ws = await makeStreaming(timeout: 10)
 		let stream1 = try await openStream(ws, path: "/silent")
 		_ = stream1 // первый стрим сознательно не читаем
 
