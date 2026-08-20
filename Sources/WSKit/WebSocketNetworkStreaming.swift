@@ -171,6 +171,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			task: task,
 			inputStream: inputStream,
 			delegateStream: delegateStream,
+			delegateContinuation: delegateContinuation,
 			outputContinuation: outputContinuation
 		)
 
@@ -370,6 +371,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		task: URLSessionWebSocketTask,
 		inputStream: AsyncStream<Data>,
 		delegateStream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
+		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		connectTask = Task { [weak self] in
