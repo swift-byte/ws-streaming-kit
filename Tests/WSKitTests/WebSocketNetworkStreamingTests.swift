@@ -405,6 +405,8 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 			return XCTFail("Ожидали .timeout, получили \(String(describing: result.thrown))")
 		}
 
+		// ws должен пережить отправку close-фрейма: ранний deinit делает
+		// invalidateAndCancel() и рвёт соединение до того, как фрейм улетит
 		try await Task.sleep(nanoseconds: 300_000_000)
 		let probe = await makeStreaming(timeout: 5)
 		let probeStream = try await openStream(probe, path: "/lastclose")
@@ -421,6 +423,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		#else
 		XCTAssertEqual(codes, ["1001"], "Таймаут должен закрывать сокет кодом goingAway (1001)")
 		#endif
+		await ws.cancel()
 	}
 
 	func testSharedStorageCookiesAreMergedAndManualWins() async throws {
