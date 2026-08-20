@@ -2,6 +2,8 @@ import asyncio, websockets
 
 LAST_CLOSE = {}
 
+LAST_CLOSE = {}
+
 async def handler(ws):
     path = ws.request.path
     try:

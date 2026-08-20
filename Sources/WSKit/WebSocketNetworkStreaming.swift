@@ -136,6 +136,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Private Methods
 
+	// closeCode — best effort: на практике сервер его не получает ни на одной
+	// платформе (Linux — обрыв без close-фрейма, Darwin — 1006; замерено CI,
+	// в т.ч. без отмены читателя)
 	private func cancel(
 		generation requested: Int,
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
@@ -145,10 +148,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		webSocketTask = nil
 		inputTask?.cancel()
 		inputTask = nil
-		// Читателя swift-отменой не трогаем: cancellation-handler асинхронного
-		// receive() на Darwin делает плоский task.cancel() и срывает
-		// graceful-close (сервер видит 1006 вместо кода). Читатель выйдет сам:
-		// закрытый сокет роняет receive()
+		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
 		connectTask = nil
