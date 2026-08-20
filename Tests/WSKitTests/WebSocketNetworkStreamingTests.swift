@@ -150,21 +150,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Unit: Cookies
 
-	func testInsecureSchemeRejectedForNonLoopbackHost() async throws {
-		// Даунгрейд wss→ws вне loopback уводил бы auth-куки открытым текстом
-		let ws = await makeStreaming(timeout: 5)
-		let (input, inputCont) = makeInput()
-		inputCont.finish()
-		do {
-			_ = try await ws.establishStream(
-				endpoint: "ws://example.com/socket", headers: [:], inputStream: input
-			)
-			XCTFail("Ожидали badURL для незащищённой схемы вне loopback")
-		} catch let error as URLError {
-			XCTAssertEqual(error.code, .badURL)
-		}
-	}
-
 	func testCreateCookieBuildsCookie() async throws {
 		let ws = await makeStreaming()
 		let url = URL(string: "ws://example.com/path")!
@@ -576,6 +561,44 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertTrue(result.events.isEmpty, "Сокет не должен открываться после cancel()")
 		XCTAssertNil(result.thrown,
 			"Явная отмена тиха во всех фазах; получили \(String(describing: result.thrown))")
+	}
+
+	func testCancelThenReconnectKeepsQuietFinish() async throws {
+		// «cancel → сразу establish» — типовой ретрай: токен убитого стрима
+		// не должен доживать до пометки вытеснения, иначе потребитель, сам
+		// вызвавший отмену, получил бы CancellationError вместо тихого finish
+		let ws = await makeStreaming(timeout: 10)
+		let stream1 = try await openStream(ws, path: "/silent")
+		let reader1 = StreamReader(stream1)
+		let first = try await reader1.next()
+		XCTAssertEqual(first, .connected)
+
+		await ws.cancel()
+		_ = try await openStream(ws, path: "/silent")
+
+		enum Outcome: Sendable { case finished, event, cancellation, other(String), timedOut }
+		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
+			group.addTask {
+				do {
+					return try await reader1.next() == nil ? .finished : .event
+				} catch is CancellationError {
+					return .cancellation
+				} catch {
+					return .other(String(describing: error))
+				}
+			}
+			group.addTask {
+				try? await Task.sleep(nanoseconds: 6_000_000_000)
+				return .timedOut
+			}
+			let winner = try await group.next() ?? .timedOut
+			group.cancelAll()
+			return winner
+		}
+		guard case .finished = outcome else {
+			return XCTFail("Явная отмена тиха и при мгновенном реконнекте; получили \(outcome)")
+		}
+		await ws.cancel()
 	}
 
 	func testSupersededActiveStreamThrowsCancellation() async throws {

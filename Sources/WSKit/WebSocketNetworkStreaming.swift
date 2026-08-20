@@ -94,8 +94,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///   single-consumer, повторная передача делит данные недетерминированно.
 	/// - До .connected inputStream не потребляется; при отказе на этой фазе он
 	///   освобождается, продюсеру приходит onTermination.
-	/// - badURL и небезопасная схема — отказы без teardown: действующий стрим
-	///   сохраняется.
+	/// - badURL — единственный отказ без teardown: действующий стрим сохраняется.
+	/// - Endpoint доверен целиком, включая схему: это SDK-внутренняя константа,
+	///   валидация даунгрейда wss→ws — забота конфигурации и ревью, не рантайма.
+	///   Пересмотреть, если endpoint станет конфигурируемым.
 	func establishStream(
 		endpoint: String,
 		headers: [String: String],
@@ -103,15 +105,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	) async throws -> AsyncThrowingStream<AssistantSDK.NetworkStreamingOutputEvent, any Error> {
 		guard let url = URL(string: endpoint) else {
 			throw URLError(.badURL)
-		}
-		// Даунгрейд схемы = auth-куки открытым текстом: не-loopback ws://
-		// отвергается до teardown. Loopback — для локальных стендов
-		if url.scheme?.lowercased() == "ws" {
-			let host = url.host?.lowercased() ?? ""
-			guard host == "127.0.0.1" || host == "localhost" || host == "::1" else {
-				Logger.assistant.error(S("Insecure ws:// endpoint rejected"))
-				throw URLError(.badURL)
-			}
 		}
 
 		// Вытеснение: помечается токен текущего владельца — живого стрима или
@@ -230,6 +223,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		connectTask = nil
 		timer?.cancel()
 		timer = nil
+		// Токен мёртвого стрима не доживает до следующего establish: иначе
+		// ретрай «cancel → establish» пометил бы его вытесненным, и потребитель,
+		// сам вызвавший отмену, получил бы CancellationError
+		currentToken = nil
 		// Любой teardown двигает поколение: отложенные хопы, токены и таймеры
 		// прошлых состояний инвалидируются разом, а отмена в окне addCookies
 		// ловится supersede-guard'ом так же, как вытеснение
