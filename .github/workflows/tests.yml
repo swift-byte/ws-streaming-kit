@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Toolchain info
+        run: |
+          sw_vers
+          swift --version
+          python3 --version
+
+      - name: Install test server dependency
+        run: python3 -m pip install websockets
+
+      - name: Start test server
+        run: |
+          nohup python3 ws_test_server.py > server.log 2>&1 &
+          sleep 2
+          python3 - <<'PY'
+          import socket
+          for p in (8901, 8902):
+              s = socket.socket(); s.settimeout(5)
+              s.connect(("127.0.0.1", p)); s.close()
+              print(f"port {p} listening")
+          PY
+
+      - name: Run tests
+        run: swift test 2>&1 | tee test-output.log
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "--- server.log ---"
+          cat server.log || true
+          echo "--- tail test-output.log ---"
+          tail -100 test-output.log || true
