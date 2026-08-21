@@ -75,8 +75,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// Continuations финиширует connectTask (обе ветви do/catch); deinit ссылок
 	// на них не имеет. Инвариант: внутри цикла connectTask нет ранних return
 	deinit {
-		webSocketTask?.cancel(with: .normalClosure, reason: nil)
+		// Порядок как в cancel(generation:): ввод — до разрыва сокета, иначе
+		// inflight-send эскалирует штатное разрушение как сбой аплинка
 		inputTask?.cancel()
+		webSocketTask?.cancel(with: .normalClosure, reason: nil)
 		outputTask?.cancel()
 		connectTask?.cancel()
 		timer?.cancel()
@@ -109,7 +111,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// вызова в окне кук. Глобальной бухгалтерии нет: токен умирает вместе
 		// со своим стримом, протухать нечему, затирать нечего
 		currentToken?.superseded = true
-		await cancel()
+		// Приватный teardown напрямую: неразрывность «пометка → teardown →
+		// чтение поколения» структурная, а не комментарийная
+		cancel(generation: generation)
 		let currentGeneration = generation
 		let lifecycleToken = LifecycleToken()
 		currentToken = lifecycleToken
@@ -144,7 +148,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			return outputStream
 		}
 
-		timeoutArbitration = .pending
+		// Условный сброс: invalidate(), успевший в окно сбора кук, уже
+		// скоммитил .disarmed — затирать его значило бы взвести страховку,
+		// которую вызывающий только что снял
+		if timeoutArbitration != .disarmed {
+			timeoutArbitration = .pending
+		}
 		let delegate = WebSocketNetworkStreamingDelegate(continuation: delegateContinuation)
 		let task = session.webSocketTask(with: request)
 		webSocketTask = task
@@ -216,6 +225,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		inputTask = nil
 		webSocketTask?.cancel(with: closeCode, reason: nil)
 		webSocketTask = nil
+		// Время жизни арбитража совпадает с остальными слотами: иначе
+		// унаследованное состояние блокировало бы invalidate() в окне кук
+		timeoutArbitration = .pending
 		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
@@ -339,8 +351,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					@unknown default:
 						payload = nil
 					}
-					// Арбитраж — по доставляемому байту: кадр, который нечем
-					// отдать потребителю, таймер не гасит
+					// Таймер гасит первый кадр, ДОСТАВЛЕННЫЙ потребителю:
+					// текстовый конвертируется и доставляется (с error-логом
+					// о нарушении binary-контракта) — значит, тоже гасит;
+					// @unknown-кадр отдать нечем — не гасит
 					guard let payload else { continue }
 					if isFirstMessage {
 						isFirstMessage = false
@@ -375,8 +389,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		connectTask = Task { [weak self] in
-			var reader: Task<Void, Never>?
 			var readerDone: AsyncStream<Void>?
+			var terminalError: Error?
 
 			// Финиш стрима — только после доставки хвоста читателем. Ожидание
 			// ограничено гонкой «сигнал завершения читателя против дедлайна»:
@@ -397,7 +411,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 			do {
 				for try await event in delegateStream {
-					if case .connected = event, reader == nil {
+					if case .connected = event, readerDone == nil {
 						// .connected выдаётся одним изолированным шагом с проверкой
 						// поколения; reader создаётся после yield, иначе .received
 						// мог бы обогнать .connected
@@ -417,7 +431,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 							// потребитель, — ждём штатного финиша через delegateStream
 							continue
 						}
-						reader = created.reader
 						readerDone = created.done
 						await self?.createInputTask(
 							generation: generation,
@@ -427,17 +440,19 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						)
 					}
 				}
-				await drainOutput()
-				if Task.isCancelled, await self?.isSuperseded(lifecycleToken) == true {
-					// Контракт вытеснения един для всех фаз жизни стрима:
-					// замена — это CancellationError, а не «сервер закрылся»
-					outputContinuation.finish(throwing: CancellationError())
-				} else {
-					outputContinuation.finish()
-				}
 			} catch {
-				await drainOutput()
-				outputContinuation.finish(throwing: error)
+				terminalError = error
+			}
+			await drainOutput()
+			// Контракт вытеснения един для всех фаз и путей завершения:
+			// замена — CancellationError, даже если delegateStream успел
+			// бросить в той же гонке
+			if Task.isCancelled, await self?.isSuperseded(lifecycleToken) == true {
+				outputContinuation.finish(throwing: CancellationError())
+			} else if let terminalError {
+				outputContinuation.finish(throwing: terminalError)
+			} else {
+				outputContinuation.finish()
 			}
 			if Task.isCancelled == false {
 				await self?.cancel(generation: generation)
@@ -505,8 +520,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {
-		guard value.rangeOfCharacter(from: .newlines) == nil, value.contains(";") == false else {
-			Logger.assistant.error(S("Cookie value rejected: control characters or separators"))
+		guard value.rangeOfCharacter(from: .controlCharacters) == nil, value.contains(";") == false else {
+			Logger.assistant.error(S("Cookie value rejected for \(name): control characters or separators"))
 			return nil
 		}
 		return HTTPCookie(properties: [

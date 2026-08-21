@@ -367,6 +367,34 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Integration: таймаут
 
+	func testInvalidateDuringCookieCollectionStillDisarms() async throws {
+		// invalidate() в окне await addCookies: коммит .disarmed должен
+		// пережить сброс арбитража при возврате из establishStream —
+		// иначе вызывающий снял страховку, а она взведена
+		let storage = CookieStorage()
+		await storage.setArtificialDelay(nanoseconds: 300_000_000)
+		let ws = WebSocketNetworkStreaming(
+			kidsURLSession: KidsURLSession(),
+			cookieStorage: storage,
+			timeout: 2
+		)
+		let (input, inputCont) = makeInput()
+		inputCont.finish()
+
+		let disarmedEndpoint = wsBase + "/silent"
+		async let pendingStream = ws.establishStream(
+			endpoint: disarmedEndpoint, headers: [:], inputStream: input
+		)
+		try await Task.sleep(nanoseconds: 100_000_000)
+		await ws.invalidate()
+
+		let stream = try await pendingStream
+		let result = await drain(stream, deadline: 5)
+		XCTAssertFalse(result.completed, "Страховка снята в окне кук — таймаут не должен выстрелить")
+		XCTAssertNil(result.thrown)
+		await ws.cancel()
+	}
+
 	func testInvalidateDisarmsHandshakeTimeout() async throws {
 		// invalidate() снимает единственную страховку: после него зависшее
 		// рукопожатие не должно завершаться самотёком
