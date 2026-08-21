@@ -3,6 +3,13 @@ import Foundation
 import FoundationNetworking
 #endif
 
+/// Что делегат сообщает connectTask'у по ходу жизни соединения. Отдельный тип,
+/// а не `NetworkStreamingOutputEvent`: наружу и внутрь ездит разное, и общий
+/// тип заставлял бы гадать, какие его случаи здесь вообще возможны
+enum HandshakeEvent: Sendable {
+	case connected
+}
+
 /// Одно прочитанное имя из `Cookies`; `value` == nil — стораж ничего не отдал
 private struct ReservedCookieRead: Sendable {
 	let name: String
@@ -50,7 +57,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	/// Метка вытеснения. Ставит её тот, кто занимает место стрима; читают двое:
-	/// connectTask вытесняемого (через `outcome(for:terminalError:)`) и сам
+	/// connectTask вытесняемого (через `outcome(for:generation:...)`) и сам
 	/// establishStream, если вытеснение случилось в окне сбора кук и connectTask
 	/// ещё не существует. Поле читается и пишется только в изоляции актора;
 	/// @unchecked нужен, чтобы токен можно было захватить замыканием connectTask
@@ -122,7 +129,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private var generation = 0
 	private var currentToken: LifecycleToken?
 	private var isTimeoutArmed = true
-	private var uplinkFailure: (generation: Int, error: NSError)?
 	private var webSocketTask: URLSessionWebSocketTask?
 	private var outputTask: Task<Void, Never>?
 	private var inputTask: Task<Void, Never>?
@@ -215,11 +221,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///   Sec-WebSocket-*, Cookie) либо это регистронезависимый дубль. Каждый
 	///   случай логируется — молча не теряется ничего.
 	/// - Сбой отправки во входном стриме закрывает соединение и пишется в лог
-	///   (домен и код), но СВОИМ исходом не становится: `send` падает лишь
-	///   когда транспорт уже кончился, а назвать причину может только делегат —
-	///   он один видит close-код. Цена размена: если транспорт завершился
-	///   чисто, обрыв аплинка виден только в логе. Собственный исход здесь
-	///   гонялся бы с close-фреймом и отбирал у потребителя причину сервера.
+	///   (домен и код), но СВОИМ исходом не становится — почему именно, см.
+	///   `noteUplinkFailure`. Цена размена: если транспорт завершился чисто,
+	///   обрыв аплинка виден только в логе.
 	/// - Сбор кук ограничен своим дедлайном: по его истечении рукопожатие
 	///   уходит без авторизации, но `establishStream` не зависает.
 	/// - Если `cookieStorage` не отдал зарезервированную куку, рукопожатие уйдёт
@@ -302,19 +306,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// путать замену со штатным закрытием), явная отмена — тихий finish,
 			// единый с контрактом поднятого стрима
 			outputContinuation.onTermination = nil
-			// Сокета ещё нет, поэтому close-кода тоже: .invalid
-			outputContinuation.finish(
-				throwing: outcome(
-					for: lifecycleToken,
-					generation: currentGeneration,
-					terminalError: nil,
-					closeCode: .invalid
-				)
-			)
+			outputContinuation.finish(throwing: outcome(for: lifecycleToken, terminalError: nil))
 			return outputStream
 		}
 
-		let (delegateStream, delegateContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
+		let (delegateStream, delegateContinuation) = AsyncThrowingStream<HandshakeEvent, Error>.makeStream()
 
 		let delegate = WebSocketNetworkStreamingDelegate(origin: url, continuation: delegateContinuation)
 		let task = session.webSocketTask(with: request)
@@ -478,7 +474,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// следующий стрим начинается со страховкой, а снятие, сделанное для
 		// прошлого, на него не переносится
 		isTimeoutArmed = true
-		uplinkFailure = nil
 		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
@@ -516,30 +511,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// разнесены внутри cancel(generation:), так что проверка Task.isCancelled
 	/// здесь проиграла бы гонку и вытеснение выглядело бы тихим финишем.
 	/// nil — тихий финиш
-	/// - Parameter generation: поколение спрашивающего стрима. Сбой аплинка
-	///   хранится с поколением, в котором случился: без сверки стрим, зависший
-	///   в окне кук, мог бы финишировать чужой ошибкой
-	private func outcome(
-		for token: LifecycleToken,
-		generation requested: Int,
-		terminalError: Error?,
-		closeCode: URLSessionWebSocketTask.CloseCode
-	) -> Error? {
+	private func outcome(for token: LifecycleToken, terminalError: Error?) -> Error? {
 		if token.superseded { return CancellationError() }
-		if let terminalError { return terminalError }
-		// Делегат промолчал — закрытие штатное. Но «штатное» бывает двух родов:
-		// сервер попрощался (код прислал он) или закрывались мы. Во втором
-		// случае, если закрывались из-за сбоя аплинка, это и есть причина —
-		// иначе обрыв записи выглядел бы для потребителя успехом.
-		// Признак «кто закрыл» — единственный доступный, и он best-effort:
-		// платформа выставляет closeCode и там, где close-фрейма не было
-		// (замерено: corelibs на обрыве TCP отдаёт 1000). Там, где различить
-		// нечем, побеждает трактовка «сервер попрощался»
-		if let uplinkFailure, uplinkFailure.generation == requested,
-		   WebSocketNetworkStreamingDelegate.isPeerCloseCode(closeCode) == false {
-			return NetworkStreamingError.transportFailure(uplinkFailure.error)
-		}
-		return nil
+		return terminalError
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
@@ -553,7 +527,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func fireTimeout(
 		generation requested: Int,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
-		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
+		delegateContinuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation
 	) {
 		guard requested == generation, isTimeoutArmed else { return }
 		failStream(
@@ -575,7 +549,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func failStream(
 		generation requested: Int,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
-		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
+		delegateContinuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation,
 		error: NetworkStreamingError
 	) {
 		guard requested == generation else { return }
@@ -634,18 +608,26 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
-	/// Причина сбоя отправки ЗАПОМИНАЕТСЯ, но не публикуется: собственный finish
-	/// выигрывал гонку у didCloseWith и подменял исход (замерено: с активным
-	/// вводом /close1011 отдавал .timeout вместо closeCode(1011), а штатный
-	/// /close1000 — .timeout вместо тихого финиша; 6/6 и 8/8 прогонов).
-	/// Запомненное всплывёт в `outcome`, только если делегат не назвал причину
-	/// И закрывались не по слову сервера.
-	/// Страховку снимаем: соединение уже рвётся, и таймаут, выстрелив в окне
-	/// дренажа, подменил бы причину точно так же
+	/// Сбой отправки остаётся в логе и НЕ становится исходом стрима. Это
+	/// решение, а не упущение: сделать его исходом пробовали трижды, и каждый
+	/// раз замеры показывали, что достоверно приписать его некуда.
+	/// 1. Собственный finish на общей continuation выигрывает гонку у
+	///    didCloseWith: с активным вводом /close1011 отдавал .timeout вместо
+	///    closeCode(1011), а штатный /close1000 — .timeout вместо тихого
+	///    финиша (6/6 и 8/8 прогонов).
+	/// 2. Отложить и достать по коду закрытия нельзя: платформа выставляет код
+	///    и там, где close-фрейма не было (corelibs на обрыве TCP отдаёт 1000).
+	/// 3. Отложить и достать по факту прихода close-фрейма (didCloseWith)
+	///    тоже нельзя: send падает ПОЗЖЕ, чем делегат называет исход, и
+	///    connectTask успевает финишировать раньше, чем сбой записан.
+	/// Причина в природе события: send падает лишь тогда, когда транспорт уже
+	/// кончился, а исход транспорта называет делегат — он один видит close-код.
+	/// Цена: транспорт, завершившийся чисто, оставляет обрыв аплинка только в
+	/// логе. Страховку снимаем — соединение уже рвётся, и таймаут, выстрелив
+	/// в окне дренажа, подменил бы причину
 	private func noteUplinkFailure(generation requested: Int, error: NSError) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
-		uplinkFailure = (requested, error)
 		disarmTimeout()
 	}
 
@@ -653,7 +635,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func createOutputTask(
 		generation requested: Int,
 		task: URLSessionWebSocketTask,
-		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
+		delegateContinuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) -> AsyncStream<Void>? {
 		// Хоп отменённой connectTask всё равно исполняется: без guard'а поздний
@@ -732,7 +714,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						// Стрим уже завершён кем-то ещё — читать больше некому
 						return
 					@unknown default:
-						continue
+						// Доставлен кадр или нет — неизвестно, а «молча терять
+						// кадры нельзя»: падаем в ту же ветку, что и .dropped
+						break
 					}
 					// Молча терять кадры нельзя: стрим падает наблюдаемо
 					Logger.assistant.error(S("Output buffer overflow: consumer is not draining"))
@@ -760,8 +744,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		lifecycleToken: LifecycleToken,
 		task: URLSessionWebSocketTask,
 		inputStream: AsyncStream<Data>,
-		delegateStream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
-		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
+		delegateStream: AsyncThrowingStream<HandshakeEvent, Error>,
+		delegateContinuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		connectTask = Task { [weak self] in
@@ -842,9 +826,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// наблюдённая причина от этого не перестаёт быть причиной
 			let outcome = await self?.outcome(
 				for: lifecycleToken,
-				generation: requested,
-				terminalError: terminalError,
-				closeCode: task.closeCode
+				terminalError: terminalError
 			) ?? terminalError
 			outputContinuation.onTermination = nil
 			outputContinuation.finish(throwing: outcome)
@@ -1014,7 +996,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			.path: "/",
 			.name: name,
 			.value: value,
-			.domain: url.host ?? ""
+			.domain: url.host.map(Self.canonicalHost) ?? ""
 		])
 		if cookie == nil {
 			// Иначе рукопожатие уходит без авторизации, а в логе — ничего:
@@ -1140,9 +1122,9 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 	/// Origin нормализуется один раз: он неизменен всё время жизни делегата,
 	/// а цепочка редиректов дёргала бы разбор на каждом хопе
 	private let origin: (scheme: String, host: String, port: Int?)?
-	private let continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
+	private let continuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation
 
-	init(origin: URL, continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation) {
+	init(origin: URL, continuation: AsyncThrowingStream<HandshakeEvent, Error>.Continuation) {
 		self.origin = Self.normalizedOrigin(of: origin)
 		self.continuation = continuation
 	}
@@ -1161,17 +1143,20 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
 		reason: Data?
 	) {
-		// Close-фрейм пришёл, значит код прислал сервер — та же таблица, что и
-		// у завершения задачи, только ошибки тут нет по определению
+		// Код прислал сервер — та же таблица, что и у завершения задачи,
+		// только ошибки тут нет по определению
 		continuation.finish(throwing: Self.completionOutcome(closeCode: closeCode, error: nil))
 	}
 
-	/// Сбоем не считаются: 1000, 1005 («кода не было» — по RFC 6455 §7.1.5
-	/// закрытие состоялось, просто без причины; это осознанное отличие от
-	/// исходной версии, где 1005 приезжал ошибкой) и .invalid — сентинел
-	/// «код не записан», по которому сказать о сбое нечего
+	/// Сбоем не считаются 1000 и 1005. Про 1005 стоит помнить, что сам код в
+	/// close-фрейме запрещён (RFC 6455 §7.4.1) — его ставит принимающая
+	/// сторона, когда фрейм пришёл БЕЗ кода; закрытие при этом состоялось,
+	/// поэтому сбоем оно не считается. Это осознанное отличие от исходной
+	/// версии, где 1005 приезжал ошибкой.
+	/// Вызывается только для кодов, прошедших `isPeerCloseCode`, поэтому
+	/// .invalid сюда не доходит и в перечислении не участвует
 	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
-		closeCode == .normalClosure || closeCode == .noStatusReceived || closeCode == .invalid
+		closeCode == .normalClosure || closeCode == .noStatusReceived
 	}
 
 	/// Код, который мог прийти в close-фрейме от сервера. 1006 и 1015 по

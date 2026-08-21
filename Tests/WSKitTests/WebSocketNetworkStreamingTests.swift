@@ -56,17 +56,17 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		)
 	}
 
-	private struct DrainResult {
-		var events: [NetworkStreamingOutputEvent]
+	private struct DrainResult<Event: Sendable> {
+		var events: [Event]
 		var thrown: Error?
 		var completed: Bool   // стрим завершился сам (finish / finish(throwing:))
 	}
 
-	private actor Collector {
-		var events: [NetworkStreamingOutputEvent] = []
+	private actor Collector<Event: Sendable> {
+		var events: [Event] = []
 		var thrown: Error?
 		var completed = false
-		func add(_ e: NetworkStreamingOutputEvent) { events.append(e) }
+		func add(_ e: Event) { events.append(e) }
 		func finish(_ error: Error?) { thrown = error; completed = true }
 	}
 
@@ -85,11 +85,11 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	/// Вычитывает стрим до его завершения либо до дедлайна.
-	private func drain(
-		_ stream: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
+	private func drain<Event: Sendable>(
+		_ stream: AsyncThrowingStream<Event, Error>,
 		deadline: Double
-	) async -> DrainResult {
-		let collector = Collector()
+	) async -> DrainResult<Event> {
+		let collector = Collector<Event>()
 		let reader = Task {
 			do {
 				for try await event in stream {
@@ -193,11 +193,11 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	private func makeDelegatePair() -> (
 		WebSocketNetworkStreamingDelegate,
-		AsyncThrowingStream<NetworkStreamingOutputEvent, Error>,
+		AsyncThrowingStream<HandshakeEvent, Error>,
 		URLSession,
 		URLSessionWebSocketTask
 	) {
-		let (stream, continuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
+		let (stream, continuation) = AsyncThrowingStream<HandshakeEvent, Error>.makeStream()
 		let delegate = WebSocketNetworkStreamingDelegate(
 			origin: URL(string: "wss://origin.example/stream")!,
 			continuation: continuation
@@ -212,7 +212,10 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let (delegate, stream, session, task) = makeDelegatePair()
 		delegate.urlSession(session, webSocketTask: task, didOpenWithProtocol: nil)
 		let result = await drain(stream, deadline: 0.3)
-		XCTAssertEqual(result.events, [.connected])
+		XCTAssertEqual(result.events.count, 1)
+		guard case .connected = result.events.first else {
+			return XCTFail("Ожидали .connected, получили \(result.events)")
+		}
 		XCTAssertFalse(result.completed, "Открытие не должно завершать стрим")
 	}
 
@@ -1235,8 +1238,8 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertNotNil(result.thrown)
 		#else
 		// Darwin: @objc-протокол, метод опциональный — платформа сначала
-		// спрашивает responds(to:). Селектора нет — метод не выставлен в ObjC,
-		// и URLSession просто пойдёт по редиректу сама
+		// спрашивает responds(to:). Пока селектор на месте, гард живёт; исчезни
+		// он — URLSession пойдёт по редиректу сама, и это надо ловить здесь
 		_ = stream
 		_ = session
 		_ = task
