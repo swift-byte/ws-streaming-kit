@@ -57,7 +57,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	/// Метка вытеснения. Ставит её тот, кто занимает место стрима; читают двое:
-	/// connectTask вытесняемого (через `outcome(for:generation:...)`) и сам
+	/// connectTask вытесняемого (через `outcome(for:terminalError:)`) и сам
 	/// establishStream, если вытеснение случилось в окне сбора кук и connectTask
 	/// ещё не существует. Поле читается и пишется только в изоляции актора;
 	/// @unchecked нужен, чтобы токен можно было захватить замыканием connectTask
@@ -177,7 +177,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Порядок как в cancel(generation:): ввод — до разрыва сокета, иначе
 		// inflight-send эскалирует штатное разрушение как сбой аплинка
 		inputTask?.cancel()
-		webSocketTask?.cancel(with: .normalClosure, reason: nil)
+		webSocketTask?.cancel()
 		outputTask?.cancel()
 		connectTask?.cancel()
 		timer?.cancel()
@@ -381,6 +381,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// вечно. Приложению, которому нужны более долгие паузы, придётся греть
 	/// соединение своим трафиком либо поднять `timeout` при инициализации.
 	///
+	/// Снятие относится к стриму, который существует В МОМЕНТ вызова: следующий
+	/// `establishStream` начинается со взведённой страховкой, и снимать её надо
+	/// заново. Вызов, попавший в окно сбора кук поднимающегося стрима, достаётся
+	/// уже ему.
 	/// В протокол `NetworkStreaming` не входит — доступен по конкретному типу.
 	func invalidate() {
 		disarmTimeout()
@@ -456,19 +460,18 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// Тело обязано оставаться синхронным (без await): establishStream
 	// полагается на неразрывность «пометка токена → teardown → чтение
 	// поколения» внутри своей изоляции.
-	// closeCode — доставка замерена: iOS 1001, macOS всегда 1006 (дефект
-	// платформы), Linux недетерминирован (0/1001) — на целевой iOS работает
-	private func cancel(
-		generation requested: Int,
-		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
-	) {
+	private func cancel(generation requested: Int) {
 		guard requested == generation else { return }
 		// Отмена ввода — до разрыва сокета: inflight-send иначе падал от
 		// разрыва раньше, чем задача видела отмену, и штатный teardown
 		// эскалировался как сбой аплинка
 		inputTask?.cancel()
 		inputTask = nil
-		webSocketTask?.cancel(with: closeCode, reason: nil)
+		// cancel() без кода: любой код, выставленный своей инициативой, попадает
+		// в closeCode задачи (замерено) и читается делегатом как слово сервера.
+		// На проводе ничего не теряем — close-фрейм при cancel(with:) всё равно
+		// не доставляется (замерено на обеих платформах)
+		webSocketTask?.cancel()
 		webSocketTask = nil
 		// Взводим обратно, потому что слот освобождается вместе с остальными:
 		// следующий стрим начинается со страховкой, а снятие, сделанное для
@@ -511,6 +514,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// разнесены внутри cancel(generation:), так что проверка Task.isCancelled
 	/// здесь проиграла бы гонку и вытеснение выглядело бы тихим финишем.
 	/// nil — тихий финиш
+	/// Вытеснение перебивает и уже наступившее штатное закрытие: пока стрим не
+	/// финишировал, он остаётся вытесняемым, и подменившему нужен однозначный
+	/// CancellationError. Обратный порядок сделал бы контракт вытеснения
+	/// зависимым от того, успел ли сервер попрощаться в окне дренажа
 	private func outcome(for token: LifecycleToken, terminalError: Error?) -> Error? {
 		if token.superseded { return CancellationError() }
 		return terminalError
@@ -542,10 +549,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// очереди) — причины, наблюдённые снаружи, приезжают через delegateStream.
 	/// Причина фиксируется на обеих continuation до разрыва сокета: иначе гонка
 	/// didClose/didComplete успела бы подменить её на «сервер договорил».
-	/// Закрываемся .goingAway, а не .normalClosure — иначе сервер записал бы
-	/// упавший стрим как штатно завершённый клиентом.
-	/// Снятый onTermination убирает Task с cancel(.normalClosure), который
-	/// гонялся бы с нашим teardown и мог перебить close-код
+	/// Снятый onTermination убирает Task с отменой, который гонялся бы с нашим
+	/// teardown
 	private func failStream(
 		generation requested: Int,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
@@ -556,7 +561,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputContinuation.onTermination = nil
 		outputContinuation.finish(throwing: error)
 		delegateContinuation.finish(throwing: error)
-		cancel(generation: requested, closeCode: .goingAway)
+		cancel(generation: requested)
 	}
 
 	private func createInputTask(
@@ -569,27 +574,25 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// наследованием изоляции на части компиляторов неявно захватывает self
 		// сильно — незавершающийся inputStream удерживал бы актора от deinit
 		inputTask = Task.detached { [weak self] in
+			/// Общий разбор сбоя отправки. Первая проверка отсекает штатный
+			/// teardown (сокет рвётся раньше, чем send видит отмену — это не
+			/// сбой аплинка); вторая — случай, когда teardown успел закрыть
+			/// сокет, пока мы ходили на актора, и закрывать его снова незачем
+			func handleSendFailure(_ error: Error) async {
+				guard Task.isCancelled == false else { return }
+				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
+				guard Task.isCancelled == false else { return }
+				task.cancel()
+			}
+
 			var sendFailed = false
 			for await data in inputStream {
 				if sendFailed { continue } // дожигаем ввод: буфер продюсера не растёт
 				do {
 					try await task.send(.data(data))
 				} catch {
-					// Штатный teardown: сокет рвётся раньше, чем send видит
-					// отмену — это не сбой аплинка
-					guard Task.isCancelled == false else { return }
 					sendFailed = true
-					await self?.noteUplinkFailure(generation: requested, error: error as NSError)
-					// Ещё одна проверка после хопа: пока мы ходили на актора,
-					// teardown мог закрыть сокет сам, и второе закрытие только
-					// перебило бы его код своим
-					guard Task.isCancelled == false else { return }
-					// cancel() без кода: любой code, выставленный своей
-					// инициативой, попал бы в closeCode задачи (замерено) и
-					// выдал бы наше закрытие за слово сервера — а по этому
-					// признаку `outcome` и отличает одно от другого.
-					// Close-фрейм при cancel(with:) всё равно не доставляется
-					task.cancel()
+					await handleSendFailure(error)
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
@@ -597,13 +600,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			do {
 				try await task.send(.data(Self.inputTerminator))
 			} catch {
-				// Тот же путь, что и у обычной отправки: без терминатора сервер
-				// продолжает добирать аплинк и может не ответить вовсе, так что
-				// оставлять соединение открытым здесь нельзя
-				guard Task.isCancelled == false else { return }
-				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
-				guard Task.isCancelled == false else { return }
-				task.cancel()
+				// Без терминатора сервер продолжает добирать аплинк и может не
+				// ответить вовсе, так что оставлять соединение открытым нельзя
+				await handleSendFailure(error)
 			}
 		}
 	}
@@ -643,7 +642,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// но без ссылки, и teardown его уже не отменил бы
 		guard requested == generation else { return nil }
 		let (done, doneContinuation) = AsyncStream<Void>.makeStream()
-		let reader = Task<Void, Never> { [weak self] in
+		// detached по той же причине, что и inputTask: Task {} внутри актора
+		// наследует его изоляцию, и весь покадровый разбор — switch, ledger,
+		// yield — исполнялся бы на сериальном экзекьюторе актора, конкурируя
+		// с cancel(), invalidate() и сбором кук следующего стрима. Изоляция
+		// нужна ровно двум вызовам ниже, и они берут её сами
+		let reader = Task.detached { [weak self] in
 			// Сигнал завершения — от самого читателя: ожидание в drainOutput
 			// становится отменяемым, промежуточный waiter не нужен
 			defer { doneContinuation.finish() }
@@ -865,13 +869,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// последняя. Порядок тотальный — sort в Swift нестабилен
 		let storedCookies = (handshakeCookieStorage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
 			.filter { cookie in
-				guard Self.reservedCookieNames.contains(cookie.name.lowercased()) else { return true }
-				// Своя кука с этим именем всё равно перекроет чужую, но молча
-				// потерянная кука хост-приложения — повод для вопросов
-				Logger.assistant.error(S("Stored cookie dropped, name reserved: \(Self.logSafe(cookie.name))"))
-				return false
-			}
-			.filter { cookie in
+				// Своя кука с зарезервированным именем всё равно перекрыла бы
+				// чужую, но молча потерянная кука хост-приложения — повод для
+				// вопросов, поэтому оба отказа логируются
+				guard Self.reservedCookieNames.contains(cookie.name.lowercased()) == false else {
+					Logger.assistant.error(S("Stored cookie dropped, name reserved: \(Self.logSafe(cookie.name))"))
+					return false
+				}
 				guard Self.isSerializableCookie(name: cookie.name, value: cookie.value) else {
 					Logger.assistant.error(S("Stored cookie dropped, not serializable: \(Self.logSafe(cookie.name))"))
 					return false
@@ -1143,9 +1147,7 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
 		reason: Data?
 	) {
-		// Код прислал сервер — та же таблица, что и у завершения задачи,
-		// только ошибки тут нет по определению
-		continuation.finish(throwing: Self.completionOutcome(closeCode: closeCode, error: nil))
+		continuation.finish(throwing: Self.closeFrameOutcome(closeCode))
 	}
 
 	/// Сбоем не считаются 1000 и 1005. Про 1005 стоит помнить, что сам код в
@@ -1153,10 +1155,10 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 	/// сторона, когда фрейм пришёл БЕЗ кода; закрытие при этом состоялось,
 	/// поэтому сбоем оно не считается. Это осознанное отличие от исходной
 	/// версии, где 1005 приезжал ошибкой.
-	/// Вызывается только для кодов, прошедших `isPeerCloseCode`, поэтому
-	/// .invalid сюда не доходит и в перечислении не участвует
+	/// .invalid — «код не записан»: сказать о сбое по нему нечего, поэтому
+	/// сбоем он тоже не считается
 	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
-		closeCode == .normalClosure || closeCode == .noStatusReceived
+		closeCode == .normalClosure || closeCode == .noStatusReceived || closeCode == .invalid
 	}
 
 	/// Код, который мог прийти в close-фрейме от сервера. 1006 и 1015 по
@@ -1229,13 +1231,18 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		closeCode: URLSessionWebSocketTask.CloseCode,
 		error: NSError?
 	) -> NetworkStreamingError? {
-		if isPeerCloseCode(closeCode) {
-			return isCleanClosure(closeCode)
-				? nil
-				: .closeCode(NetworkStreamingOutputError(code: closeCode))
-		}
+		if isPeerCloseCode(closeCode) { return closeFrameOutcome(closeCode) }
 		guard let error, isCleanTransportError(error) == false else { return nil }
 		return .transportFailure(error)
+	}
+
+	/// Исход по коду закрытия, о котором известно, что закрытие состоялось:
+	/// сюда приходят и локальные сентинелы (1006/1015), и молчать о них нельзя —
+	/// закрытие было ненормальным, а ошибка завершения приедет уже после
+	/// финиша и ничего не добавит (finish первый-выигрывает)
+	static func closeFrameOutcome(_ closeCode: URLSessionWebSocketTask.CloseCode) -> NetworkStreamingError? {
+		guard isCleanClosure(closeCode) == false else { return nil }
+		return .closeCode(NetworkStreamingOutputError(code: closeCode))
 	}
 
 	private static func normalizedOrigin(of url: URL) -> (scheme: String, host: String, port: Int?)? {
