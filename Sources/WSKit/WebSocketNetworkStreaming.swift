@@ -7,14 +7,43 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Private Types
 
-	/// Причина разрушения стрима, проставленная его инициатором. Пишет тот, кто
-	/// рвёт соединение; читает connectTask разрушаемого стрима, чтобы отличить
-	/// вытеснение (CancellationError) от явной отмены (тихий finish).
-	/// Оба поля читаются и пишутся только в изоляции актора; @unchecked нужен,
+	/// Вес очереди выходного стрима. Живёт отдельным типом, чтобы инвариант
+	/// («в очереди лежат ровно последние `depth` записанных кадров») можно было
+	/// проверить тестом, а не только глазами по циклу читателя.
+	/// FIFO с головным индексом: removeFirst на каждый кадр давал бы
+	/// O(n)-сдвиг ровно в том режиме, ради которого граница и заведена
+	struct OutputQueueLedger {
+
+		private var sizes = [Int]()
+		private var head = 0
+		private(set) var bytes = 0
+
+		/// - Parameter depth: сколько элементов реально лежит в очереди сейчас
+		/// - Returns: вес очереди после учёта кадра
+		@discardableResult
+		mutating func record(size: Int, depth: Int) -> Int {
+			sizes.append(size)
+			bytes += size
+			while sizes.count - head > depth {
+				bytes -= sizes[head]
+				head += 1
+			}
+			// Компактим редко: пока голова не ушла дальше полной глубины,
+			// хвост массива дешевле, чем сдвиг
+			if head > depth {
+				sizes.removeFirst(head)
+				head = 0
+			}
+			return bytes
+		}
+	}
+
+	/// Метка вытеснения. Ставит её тот, кто занимает место стрима; читает
+	/// connectTask вытесняемого, чтобы отличить замену от прочих исходов.
+	/// Поле читается и пишется только в изоляции актора; @unchecked нужен,
 	/// чтобы токен можно было захватить замыканием connectTask
 	private final class LifecycleToken: @unchecked Sendable {
 		var superseded = false
-		var cancelled = false
 	}
 
 	// MARK: - Private Properties
@@ -123,7 +152,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///
 	/// Порядок событий: `.connected`, затем `.received` в порядке прихода.
 	/// Исходы стрима:
-	/// - тихий `finish()` — штатное закрытие сервером или явный `cancel()`;
+	/// - тихий `finish()` — штатное закрытие сервером (в том числе close-фрейм
+	///   без кода, 1005: по RFC 6455 7.1.5 это завершённое закрытие, а не сбой)
+	///   или явный `cancel()`, если причина к тому моменту ещё не известна;
 	/// - `CancellationError` — стрим вытеснен следующим `establishStream`;
 	/// - `NetworkStreamingError.timeout` — первое сообщение не пришло за
 	///   `timeout` секунд; дедлайн тикает и ПОСЛЕ `.connected`, снять его можно
@@ -334,9 +365,6 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
 	) {
 		guard requested == generation else { return }
-		// Причина фиксируется на токене до того, как он потеряется: connectTask
-		// отличит явную отмену (тихий finish) от гонки с терминальным событием
-		currentToken?.cancelled = true
 		// Отмена ввода — до разрыва сокета: inflight-send иначе падал от
 		// разрыва раньше, чем задача видела отмену, и штатный teardown
 		// эскалировался как сбой аплинка
@@ -372,10 +400,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return true
 	}
 
-	/// Изоляционный шлюз: connectTask читает флаги токена снаружи изоляции,
+	/// Изоляционный шлюз: connectTask читает флаг токена снаружи изоляции,
 	/// а дисциплина @unchecked требует все обращения вести через актора.
-	private func outcome(for token: LifecycleToken) -> (superseded: Bool, cancelled: Bool) {
-		(token.superseded, token.cancelled)
+	private func isSuperseded(_ token: LifecycleToken) -> Bool {
+		token.superseded
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
@@ -477,12 +505,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			defer { doneContinuation.finish() }
 			var isFirstMessage = true
 			var warnedTextFrame = false
-			// Вес очереди: FIFO размеров с головным индексом. removeFirst на
-			// каждый кадр давал бы O(n)-сдвиг ровно в том режиме, ради которого
-			// граница и заведена, — когда потребитель уже не успевает
-			var queuedSizes: [Int] = []
-			var queuedHead = 0
-			var queuedBytes = 0
+			var ledger = OutputQueueLedger()
 			do {
 				while Task.isCancelled == false {
 					let message = try await task.receive()
@@ -523,17 +546,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// не имеет), то есть срабатывает чуть раньше, а не позже
 					switch outputContinuation.yield(.received(payload)) {
 					case .enqueued(let remaining):
-						queuedSizes.append(payload.count)
-						queuedBytes += payload.count
-						let depth = Self.outputBufferDepth - remaining
-						while queuedSizes.count - queuedHead > depth {
-							queuedBytes -= queuedSizes[queuedHead]
-							queuedHead += 1
-						}
-						if queuedHead > Self.outputBufferDepth {
-							queuedSizes.removeFirst(queuedHead)
-							queuedHead = 0
-						}
+						let queuedBytes = ledger.record(
+							size: payload.count,
+							depth: Self.outputBufferDepth - remaining
+						)
 						guard queuedBytes > Self.outputBufferBytes else { continue }
 					case .dropped:
 						break
@@ -609,18 +625,21 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						) == true else {
 							continue
 						}
-						guard let created = await self?.createOutputTask(
+						// self связывается на время настройки — окно короткое и
+						// заканчивается вместе с этим блоком, актор оно не удержит
+						guard let self else { continue }
+						guard let created = await self.createOutputTask(
 							generation: generation,
 							task: task,
 							outputContinuation: outputContinuation
-						) ?? nil else {
+						) else {
 							// Отказ означает teardown в окне хопа: ранний return
 							// подвесил бы continuation, которую может дочитывать
 							// потребитель, — ждём штатного финиша через delegateStream
 							continue
 						}
 						readerDone = created
-						await self?.createInputTask(
+						await self.createInputTask(
 							generation: generation,
 							task: task,
 							inputStream: inputStream,
@@ -632,20 +651,21 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				terminalError = error
 			}
 			await drainOutput()
-			// Исход разрушенного стрима решает его инициатор, а не гонка с
-			// терминальным событием того же teardown'а: вытеснение —
-			// CancellationError, явная отмена — тихий finish. Терминальная
-			// ошибка остаётся исходом там, где стрим умер сам
+			// Вытеснение перебивает всё: подменившему стриму нужен однозначный
+			// CancellationError, иначе ретрай-логика примет замену за закрытие.
+			// Дальше — уже наблюдённая причина: явная отмена сама по себе
+			// терминальной ошибки не порождает (наше закрытие делегат мапит в
+			// чистый финиш), так что дошедший сюда terminalError возник ДО
+			// отмены, и гасить его нечем — вызвавший отмену вправе его
+			// проигнорировать.
 			// Исход читается ДО снятия onTermination, чтобы между снятием и
-			// финишем не осталось точки приостановки. Снимаем же его потому,
-			// что иначе финиш планирует Task с cancel() того же поколения,
-			// который следующей строкой отрабатывает и сам — хоп холостой
-			let outcome = Task.isCancelled ? await self?.outcome(for: lifecycleToken) : nil
+			// финишем не осталось точки приостановки. Снимаем же потому, что
+			// иначе финиш планирует Task с cancel() того же поколения, который
+			// следующей строкой отрабатывает и сам — хоп холостой
+			let superseded = Task.isCancelled ? await self?.isSuperseded(lifecycleToken) : nil
 			outputContinuation.onTermination = nil
-			if outcome?.superseded == true {
+			if superseded == true {
 				outputContinuation.finish(throwing: CancellationError())
-			} else if outcome?.cancelled == true {
-				outputContinuation.finish()
 			} else if let terminalError {
 				outputContinuation.finish(throwing: terminalError)
 			} else {
@@ -692,14 +712,18 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			merged[cookie.name] = cookie
 		}
 
-		for cookie in Cookies.allCases {
-			guard let value = await cookieStorage.getCookie(name: cookie.rawValue) else {
+		// Запросы независимы, поэтому идут одной пачкой: последовательные await
+		// стоили бы N задержек стоража и, что важнее, N точек приостановки —
+		// каждая расширяет окно, в котором конкурентный establish/cancel
+		// обесценит уже собранный запрос
+		for (name, value) in await fetchReservedCookies() {
+			guard let value else {
 				// Рукопожатие уйдёт без авторизации, и сервер закроет его сам —
 				// без этого лога причина отказа неотличима от серверной
-				Logger.assistant.error(S("Missing SDK cookie: \(cookie.rawValue)"))
+				Logger.assistant.error(S("Missing SDK cookie: \(name)"))
 				continue
 			}
-			if let outCookie = createCookie(name: cookie.rawValue, value: value, for: url) {
+			if let outCookie = createCookie(name: name, value: value, for: url) {
 				merged[outCookie.name] = outCookie
 			}
 		}
@@ -711,6 +735,22 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		for (headerField, headerValue) in cookieHeaders {
 			request.setValue(headerValue, forHTTPHeaderField: headerField)
+		}
+	}
+
+	/// Результат упорядочен по имени: задачи финишируют в произвольном порядке,
+	/// а заголовок должен собираться одинаково от запуска к запуску
+	private func fetchReservedCookies() async -> [(name: String, value: String?)] {
+		let storage = cookieStorage
+		return await withTaskGroup(of: (String, String?).self) { group in
+			for cookie in Cookies.allCases {
+				group.addTask { (cookie.rawValue, await storage.getCookie(name: cookie.rawValue)) }
+			}
+			var fetched = [(name: String, value: String?)]()
+			for await (name, value) in group {
+				fetched.append((name, value))
+			}
+			return fetched.sorted { $0.name < $1.name }
 		}
 	}
 
@@ -735,15 +775,21 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {
 		guard Self.isSerializableCookie(name: name, value: value) else {
-			Logger.assistant.error(S("Cookie rejected for \(name): control characters or separators"))
+			Logger.assistant.error(S("Cookie rejected for \(Self.logSafe(name)): control characters or separators"))
 			return nil
 		}
-		return HTTPCookie(properties: [
+		let cookie = HTTPCookie(properties: [
 			.path: "/",
 			.name: name,
 			.value: value,
 			.domain: url.host ?? ""
 		])
+		if cookie == nil {
+			// Иначе рукопожатие уходит без авторизации, а в логе — ничего:
+			// отказ сервера не отличить от настоящего серверного
+			Logger.assistant.error(S("Cookie properties rejected by Foundation for \(Self.logSafe(name))"))
+		}
+		return cookie
 	}
 
 	/// Имя — RFC 7230 token (RFC 6265 4.1.1 ссылается на него же). Строгость
@@ -765,10 +811,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	private static func isCookieOctets(_ text: String) -> Bool {
 		text.unicodeScalars.allSatisfy { scalar in
-			scalar.value >= 0x20 && scalar.value != 0x7F
-				&& (scalar.value < 0x80 || scalar.value > 0x9F)
-				&& scalar != ";" && scalar != ","
+			isPrintableScalar(scalar) && scalar != ";" && scalar != ","
 		}
+	}
+
+	/// Управляющий символ, попавший на провод, ломает разбор у любого
+	/// снисходительного парсера, поэтому правило одно на все тексты, которые
+	/// мы туда кладём: ни C0, ни DEL, ни C1 (0x80–0x9F). Cf (U+FEFF, U+200B,
+	/// мягкий перенос) разрешены намеренно — ими ничего не разорвать
+	private static func isPrintableScalar(_ scalar: Unicode.Scalar) -> Bool {
+		scalar.value >= 0x20 && scalar.value != 0x7F
+			&& (scalar.value < 0x80 || scalar.value > 0x9F)
 	}
 
 	// MARK: - Header Validation
@@ -794,21 +847,21 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// управляющими символами Foundation принимает дословно, поэтому
 	/// отбраковываем сами. Пробел и таб уже отсечены проверкой `> 0x20`,
 	/// в наборе разделителей их нет
-	private static let tokenSeparators = Set("()<>@,;:\\\"/[]?={}")
+	private static let tokenSeparators = Set("()<>@,;:\\\"/[]?={}".unicodeScalars)
 
 	private static func isToken(_ text: String) -> Bool {
 		guard text.isEmpty == false else { return false }
 		return text.unicodeScalars.allSatisfy { scalar in
 			scalar.isASCII && scalar.value > 0x20 && scalar.value != 0x7F
-				&& tokenSeparators.contains(Character(scalar)) == false
+				&& tokenSeparators.contains(scalar) == false
 		}
 	}
 
 	/// Значение с CR/LF/NUL Foundation отбрасывает вместе со всем заголовком —
-	/// молча. HTAB и пробел легальны
+	/// молча. HTAB легален и разрешён отдельно, остальное — общее правило
 	private static func isValidHeaderValue(_ value: String) -> Bool {
 		value.unicodeScalars.allSatisfy { scalar in
-			scalar.value == 0x09 || (scalar.value >= 0x20 && scalar.value != 0x7F)
+			scalar.value == 0x09 || isPrintableScalar(scalar)
 		}
 	}
 

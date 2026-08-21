@@ -1217,6 +1217,47 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(inner.code, Int(POSIXErrorCode.ENOTCONN.rawValue))
 	}
 
+	// MARK: - Unit: вес выходной очереди
+
+	func testLedgerCountsOnlyWhatIsStillQueued() {
+		// Инвариант: в очереди лежат ровно последние `depth` записанных кадров,
+		// вес считается по ним и ни по чему больше
+		var ledger = WebSocketNetworkStreaming.OutputQueueLedger()
+		XCTAssertEqual(ledger.record(size: 10, depth: 1), 10)
+		XCTAssertEqual(ledger.record(size: 20, depth: 2), 30)
+		XCTAssertEqual(ledger.record(size: 30, depth: 3), 60)
+		// Потребитель вычитал два первых кадра — их вес уходит из счёта
+		XCTAssertEqual(ledger.record(size: 40, depth: 2), 70)
+		// И всё остальное
+		XCTAssertEqual(ledger.record(size: 50, depth: 1), 50)
+		XCTAssertEqual(ledger.record(size: 60, depth: 0), 0)
+	}
+
+	func testLedgerStaysExactAcrossCompaction() {
+		// Голова уезжает вперёд и массив компактится — счёт не должен поехать
+		var ledger = WebSocketNetworkStreaming.OutputQueueLedger()
+		var reference = [Int]()
+		let depth = 4
+		for step in 1...500 {
+			let size = step % 17 + 1
+			reference.append(size)
+			if reference.count > depth { reference.removeFirst(reference.count - depth) }
+			XCTAssertEqual(
+				ledger.record(size: size, depth: depth),
+				reference.reduce(0, +),
+				"шаг \(step)"
+			)
+		}
+	}
+
+	func testLedgerDrainsToZeroWhenQueueEmpties() {
+		var ledger = WebSocketNetworkStreaming.OutputQueueLedger()
+		for _ in 0..<100 { ledger.record(size: 1_000, depth: 100) }
+		XCTAssertEqual(ledger.bytes, 100_000)
+		XCTAssertEqual(ledger.record(size: 7, depth: 1), 7)
+		XCTAssertEqual(ledger.bytes, 7)
+	}
+
 	// MARK: - Integration: переполнение выходной очереди
 
 	func testOutputBufferOverflowFailsStreamInsteadOfGrowing() async throws {
