@@ -759,6 +759,41 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		}
 	}
 
+	func testHungCookieStorageDoesNotHangEstablishStream() async throws {
+		// Сбор кук идёт до появления стрима: отчитаться о проблеме ещё не через
+		// что, поэтому зависший стораж подвесил бы сам establishStream и
+		// вызывающий не получил бы даже объекта стрима
+		let storage = CookieStorage()
+		await storage.setArtificialDelay(nanoseconds: 60_000_000_000)
+		await storage.set("abc123", for: Cookies.session.rawValue)
+		let ws = WebSocketNetworkStreaming(
+			kidsURLSession: KidsURLSession(),
+			cookieStorage: storage,
+			timeout: 10
+		)
+		let (input, inputCont) = makeInput()
+		inputCont.finish()
+
+		let start = Date()
+		let stream = try await ws.establishStream(
+			endpoint: wsBase + "/cookie",
+			headers: [:],
+			inputStream: input
+		)
+		let elapsed = Date().timeIntervalSince(start)
+		XCTAssertLessThan(elapsed, 15, "establishStream не должен ждать стораж дольше своего дедлайна")
+
+		// Рукопожатие уходит без кук — сервер это увидит
+		var iterator = stream.makeAsyncIterator()
+		let first = try await iterator.next()
+		XCTAssertEqual(first, .connected)
+		guard case .received(let data)? = try await iterator.next() else {
+			return XCTFail("Ожидали данные с Cookie-заголовком")
+		}
+		XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("abc123"))
+		await ws.cancel()
+	}
+
 	func testSecureAndLoopbackEndpointsPassValidation() throws {
 		// wss/https проходят с любым хостом, ws/http — только на loopback.
 		// Валидация проверяется напрямую: поднимать сокет (тем более наружу)

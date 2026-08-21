@@ -73,15 +73,20 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// 1024 кадра по maximumMessageSize это уже гигабайт, который iOS не
 	/// переживёт; одних байтов мало — AsyncStream умеет ограничивать только
 	/// число элементов, и байтовый счёт снимается с его же remaining
+	/// Чтение кук должно быть мгновенным; столько ждать его уже патология
+	private static let cookieCollectionNanoseconds: UInt64 = 5_000_000_000
+
 	private static let outputBufferDepth = 1024
 	private static let outputBufferBytes = 8 * 1024 * 1024
 
 	/// Платформенный дедлайн простоя — последняя страховка от соединения,
-	/// умершего без FIN: сокет, молчащий дольше, CFNetwork закроет сам.
-	/// Дефолтные 60с рвали здоровое соединение раньше нашего таймера и
-	/// обесценивали invalidate(), поэтому дедлайн выводится из timeout и
-	/// заведомо длиннее его. Приложению, которому нужны более долгие паузы,
-	/// придётся греть соединение на своём уровне: ping/pong тут не заводим —
+	/// умершего без FIN: сокет, молчащий дольше, CFNetwork закроет сам, и
+	/// потребитель увидит `.nsError`.
+	/// Задаётся явно ради одного инварианта: платформа не должна опережать наш
+	/// собственный дедлайн, иначе `timeout` больше `timeoutIntervalForRequest`
+	/// не значил бы ничего. Цена выбора названа прямо: пауза в диалоге,
+	/// пережившая `invalidate()`, ограничена этим же числом, а мёртвое
+	/// соединение замечается за то же время. Ping/pong снял бы размен, но
 	/// проверить его на целевой платформе из этого окружения нечем
 	private static func platformRequestTimeout(for timeout: Int) -> TimeInterval {
 		max(TimeInterval(timeout) * 2, 300)
@@ -183,8 +188,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///   (Connection, Upgrade, Host, Content-Length, Transfer-Encoding,
 	///   Sec-WebSocket-*, Cookie) либо это регистронезависимый дубль. Каждый
 	///   случай логируется — молча не теряется ничего.
-	/// - Сбой отправки во входном стриме закрывает соединение и пишется в лог;
-	///   исход потребителю называет транспорт, а не сбой отправки.
+	/// - Сбой отправки во входном стриме закрывает соединение и пишется в лог
+	///   (домен и код), но СВОИМ исходом не становится: `send` падает лишь
+	///   когда транспорт уже кончился, а назвать причину может только делегат —
+	///   он один видит close-код. Цена размена: если транспорт завершился
+	///   чисто, обрыв аплинка виден только в логе. Собственный исход здесь
+	///   гонялся бы с close-фреймом и отбирал у потребителя причину сервера.
+	/// - Сбор кук ограничен своим дедлайном: по его истечении рукопожатие
+	///   уходит без авторизации, но `establishStream` не зависает.
 	/// - Если `cookieStorage` не отдал зарезервированную куку, рукопожатие уйдёт
 	///   без неё, и отказ придёт от сервера: `.closeCode`, если тот принял
 	///   апгрейд и закрыл сокет, либо `.nsError`, если отказал ещё на HTTP.
@@ -521,7 +532,16 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					guard Task.isCancelled == false else { return }
 					sendFailed = true
 					await self?.noteUplinkFailure(generation: requested, error: error as NSError)
-					task.cancel(with: .goingAway, reason: nil)
+					// Ещё одна проверка после хопа: пока мы ходили на актора,
+					// teardown мог закрыть сокет сам, и второе закрытие только
+					// перебило бы его код своим
+					guard Task.isCancelled == false else { return }
+					// .normalClosure, а не .goingAway: закрытие по своей
+					// инициативе выставляет closeCode задачи (замерено: 1001),
+					// а делегат считает код закрытия словом сервера. Чистый код
+					// не искажает картину; на проводе разницы нет — close-фрейм
+					// при cancel(with:) всё равно не доставляется
+					task.cancel(with: .normalClosure, reason: nil)
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
@@ -529,9 +549,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			do {
 				try await task.send(.data(Self.inputTerminator))
 			} catch {
-				// Терминальное событие уже едет к потребителю через делегата —
-				// здесь нужен лишь след в логе, что конец ввода не доехал
-				Logger.assistant.error(S("WebSocket input terminator send failed"))
+				// Тот же путь, что и у обычной отправки: без терминатора сервер
+				// продолжает добирать аплинк и может не ответить вовсе, так что
+				// оставлять соединение открытым здесь нельзя
+				guard Task.isCancelled == false else { return }
+				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
+				guard Task.isCancelled == false else { return }
+				task.cancel(with: .normalClosure, reason: nil)
 			}
 		}
 	}
@@ -735,13 +759,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// финишем не осталось точки приостановки. Снимаем же потому, что
 			// иначе финиш планирует Task с cancel() того же поколения, который
 			// следующей строкой отрабатывает и сам — хоп холостой
-			let outcome = await self?.outcome(for: lifecycleToken, terminalError: terminalError)
+			// ?? nil схлопывает двойную опциональность (актор мог уйти) в одну:
+			// без него `if let` снял бы лишь внешний уровень и «тихий финиш»
+			// стало бы невозможно отличить от «актора нет»
+			let outcome = await self?.outcome(for: lifecycleToken, terminalError: terminalError) ?? nil
 			outputContinuation.onTermination = nil
-			if let outcome {
-				outputContinuation.finish(throwing: outcome)
-			} else {
-				outputContinuation.finish()
-			}
+			outputContinuation.finish(throwing: outcome)
 			if Task.isCancelled == false {
 				await self?.cancel(generation: requested)
 			}
@@ -775,10 +798,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// last-wins сервер и примет, то есть ровно в обход фильтра по имени.
 		// Одноимённые упорядочены по возрастанию специфичности, побеждает
 		// последняя. Порядок тотальный — sort в Swift нестабилен
-		// Стораж читается напрямую, а не через session.configuration: он и так
-		// .shared (выставлен в init), а прямое обращение не даёт правке
-		// конфигурации молча сменить источник кук
-		let storedCookies = (HTTPCookieStorage.shared.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
+		// Источник кук берём из конфигурации сессии, а не из .shared напрямую:
+		// иначе правка configuration.httpCookieStorage развела бы то, чем
+		// оперирует URLSession, и то, что мы кладём в заголовок
+		let storage = session.configuration.httpCookieStorage
+		let storedCookies = (storage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
 			.filter { Self.reservedCookieNames.contains($0.name.lowercased()) == false }
 			.filter { cookie in
 				guard Self.isSerializableCookie(name: cookie.name, value: cookie.value) else {
@@ -823,18 +847,48 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
+	/// Сбор кук — единственная фаза до появления стрима: отчитаться о проблеме
+	/// ещё не через что, и незавершившийся стораж подвесил бы сам
+	/// `establishStream` (кейчейн на заблокированном устройстве — реальный
+	/// сценарий). Поэтому фаза ограничена своим дедлайном, а гонка идёт через
+	/// сигнальный стрим, а не через группу: группа дожидается ВСЕХ детей и
+	/// зависшего чтения не бросила бы. По дедлайну рукопожатие уходит без кук —
+	/// сервер его отклонит, и это определённый исход, а не вечное ожидание
 	private func fetchReservedCookies() async -> [String: String] {
 		let storage = cookieStorage
-		return await withTaskGroup(of: (String, String?).self) { group in
-			for cookie in Cookies.allCases {
-				group.addTask { (cookie.rawValue, await storage.getCookie(name: cookie.rawValue)) }
-			}
+		let (signal, signalContinuation) = AsyncStream<[String: String]?>.makeStream()
+
+		let fetch = Task {
 			var fetched = [String: String]()
-			for await (name, value) in group {
-				fetched[name] = value
+			await withTaskGroup(of: (String, String?).self) { group in
+				for cookie in Cookies.allCases {
+					group.addTask { (cookie.rawValue, await storage.getCookie(name: cookie.rawValue)) }
+				}
+				for await (name, value) in group {
+					fetched[name] = value
+				}
+			}
+			signalContinuation.yield(fetched)
+			signalContinuation.finish()
+		}
+		let deadline = Task {
+			try? await Task.sleep(nanoseconds: Self.cookieCollectionNanoseconds)
+			signalContinuation.yield(nil)
+			signalContinuation.finish()
+		}
+		defer {
+			fetch.cancel()
+			deadline.cancel()
+		}
+
+		for await fetched in signal {
+			guard let fetched else {
+				Logger.assistant.error(S("Cookie collection timed out, handshake goes out unauthenticated"))
+				return [:]
 			}
 			return fetched
 		}
+		return [:]
 	}
 
 	/// Специфичность куки по RFC 6265 5.4: сперва длина path, при равной —
