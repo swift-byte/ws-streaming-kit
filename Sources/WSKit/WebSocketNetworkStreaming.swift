@@ -16,6 +16,22 @@ private struct ReservedCookieRead: Sendable {
 	let value: String?
 }
 
+/// Несколько решений в этом файле выглядят неочевидно и уже пересматривались.
+/// Что замерено и почему сделано так:
+///
+/// 1. Свой close-код не выставляем никогда. `cancel(with:)` записывает код в
+///    задачу, а из задачи мы восстанавливаем код СЕРВЕРА, когда didCloseWith не
+///    доехал: свой затёр бы чужой. На провод close-фрейм при этом всё равно не
+///    уходит, так что вежливости мы не теряем.
+/// 2. Сбой отправки не становится исходом стрима — только логом. Три попытки
+///    сделать иначе (сразу опубликовать; восстановить «кто закрыл» из кода
+///    закрытия; из факта didCloseWith) сломались по трём разным причинам,
+///    см. `noteUplinkFailure`.
+/// 3. После сбоя отправки терминатор не шлётся. Он значит «ввод закончен», а
+///    ввод оборван: сервер ответил бы на обрезанную реплику, и неверный ответ
+///    было бы не отличить от верного.
+/// 4. Loopback распознаём только в канонической записи: резолвер читает октет
+///    с ведущим нулём восьмерично, и «0127.1» у него 87.0.0.1 — публичный адрес.
 actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Private Types
@@ -177,13 +193,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Порядок как в cancel(generation:): ввод — до разрыва сокета, иначе
 		// inflight-send эскалирует штатное разрушение как сбой аплинка
 		inputTask?.cancel()
-		webSocketTask?.cancel(with: .normalClosure, reason: nil)
+		webSocketTask?.cancel()
 		outputTask?.cancel()
 		connectTask?.cancel()
 		timer?.cancel()
-		// Close-фрейма мы больше не шлём (см. cancel(generation:)), так что
-		// ждать его отправки незачем: invalidateAndCancel сразу отпускает
-		// сессию и её делегата
+		// Close-фрейма мы не шлём (см. cancel(generation:)), так что ждать его
+		// отправки незачем: invalidateAndCancel сразу отпускает сессию и делегата
 		session.invalidateAndCancel()
 	}
 
@@ -496,11 +511,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// эскалировался как сбой аплинка
 		inputTask?.cancel()
 		inputTask = nil
-		// Штатное закрытие с кодом: сервер должен отличать «пользователь
-		// договорил» от «связь оборвалась». Своим словом сервера этот код уже
-		// не притворится — completionOutcome доверяет только кодам С ПРИЧИНОЙ,
-		// а чистый разбирает наравне с ошибкой завершения
-		webSocketTask?.cancel(with: .normalClosure, reason: nil)
+		// cancel() без кода — и это не выбор между вежливостью и грубостью.
+		// cancel(with:) ЗАПИСЫВАЕТ код в задачу (замерено), а из задачи мы
+		// восстанавливаем код сервера, когда didCloseWith не доехал: свой 1000
+		// затёр бы там чужой 1011, и ошибка сервера пришла бы потребителю тихим
+		// финишем. Вежливости при этом всё равно нет — close-фрейм при
+		// cancel(with:) на провод не попадает (замерено на обеих платформах)
+		webSocketTask?.cancel()
 		webSocketTask = nil
 		// Взводим обратно, потому что слот освобождается вместе с остальными:
 		// следующий стрим начинается со страховкой, а снятие, сделанное для
@@ -599,15 +616,25 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		inputStream: AsyncStream<Data>
 	) {
 		guard requested == generation else { return }
-		// detached с [weak self]: тело почти не трогает актора, а Task {} с
-		// наследованием изоляции на части компиляторов неявно захватывает self
-		// сильно — незавершающийся inputStream удерживал бы актора от deinit
+		// detached, чтобы тело не исполнялось на экзекьюторе актора: покадровая
+		// отправка изоляции не требует, а очередь актора делит с cancel(),
+		// invalidate() и сбором кук следующего стрима. Актора это не удерживает
+		// ни здесь, ни в Task { [weak self] } — ссылка слабая (пруф:
+		// testActorDeinitsWhileConnectionAlive)
 		inputTask = Task.detached { [weak self] in
-			/// Проверка отсекает штатный teardown: сокет рвётся раньше, чем send
-			/// видит отмену, и это не сбой аплинка
-			func noteSendFailure(_ error: Error, closing: Bool) async {
+			/// Разбор сбоя отправки. Проверка отсекает штатный teardown: сокет
+			/// рвётся раньше, чем send видит отмену, и это не сбой аплинка.
+			/// Сокет закрываем всегда: оставить его открытым значит оставить
+			/// сервер ждать аплинк, а потребителя — висеть до платформенного
+			/// дедлайна. Цена известна и принята: наша отмена может опередить
+			/// CFNetwork и подменить настоящую причину на -999, то есть свести
+			/// исход к тихому финишу. Тихий финиш без ответа потребитель
+			/// переживёт и повторит; неверный ответ — нет (см. ниже)
+			func failUplink(_ error: Error) async {
 				guard Task.isCancelled == false else { return }
-				await self?.noteUplinkFailure(generation: requested, error: error as NSError, closing: closing)
+				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
+				guard Task.isCancelled == false else { return }
+				task.cancel()
 			}
 
 			var sendFailed = false
@@ -617,29 +644,19 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					try await task.send(.data(data))
 				} catch {
 					sendFailed = true
-					// Сокет НЕ закрываем: send падает, когда транспорт уже
-					// кончился, и его настоящую причину сейчас записывает
-					// CFNetwork. Наша отмена, успей она первой, подменила бы её
-					// на -999, а тот делегат считает чистым завершением —
-					// реальный обрыв связи стал бы тихим финишем
-					await noteSendFailure(error, closing: false)
+					await failUplink(error)
 				}
 			}
-			// Терминатор шлём и после сбоя: если транспорт всё-таки жив, сервер
-			// дождётся конца ввода и ответит; если нет — отправка упадёт и мы
-			// закроем сокет. Пропустить его значило бы оставить сервер ждать
-			// аплинк, а потребителя — висеть до платформенного дедлайна
-			guard Task.isCancelled == false else { return }
+			// После сбоя терминатор НЕ шлём: он означает «ввод закончен», а ввод
+			// не закончен — он оборван. Сервер ответил бы на обрезанную реплику,
+			// и потребитель получил бы правдоподобный неверный ответ, которого
+			// ничем не отличить от верного
+			guard Task.isCancelled == false, sendFailed == false else { return }
 			Logger.assistant.info(S("Input stream finished"))
 			do {
 				try await task.send(.data(Self.inputTerminator))
 			} catch {
-				// А здесь закрываем: без терминатора сервер продолжает добирать
-				// аплинк и может не ответить вовсе. Ждать тут нечего, поэтому
-				// риск подменить причину оправдан
-				await noteSendFailure(error, closing: true)
-				guard Task.isCancelled == false else { return }
-				task.cancel()
+				await failUplink(error)
 			}
 		}
 	}
@@ -663,18 +680,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// просто нет случая «даунлинк жив, аплинк умер», и любой обходной путь
 	/// сводится к трём выше. Настоящее решение — отдельный случай в контракте
 	/// SDK, и вводить его надо синхронно с вызывающим кодом.
-	/// Страховку снимаем — соединение уже рвётся, и таймаут, выстрелив в окне
-	/// дренажа, подменил бы причину
-	/// - Parameter closing: закрываем ли мы сокет вслед за этим. Страховку
-	///   снимаем только тогда: иначе таймаут гонялся бы с нашим же teardown.
-	///   Оставлять её взведённой при `closing: false` смысла немного — первое
-	///   же принятое сообщение её уже сняло, — но и снимать нечего: стрим здесь
-	///   ограничивает не она, а отправка терминатора, которая после конца ввода
-	///   либо доедет, либо закроет сокет
-	private func noteUplinkFailure(generation requested: Int, error: NSError, closing: Bool) {
+	/// Цена принята потому, что альтернатива хуже: см. отправку терминатора
+	private func noteUplinkFailure(generation requested: Int, error: NSError) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
-		if closing { disarmTimeout() }
+		// Страховку снимаем: сокет закрывается следом, и таймаут, выстрелив в
+		// окне дренажа, подменил бы причину
+		disarmTimeout()
 	}
 
 	/// Заводит читателя и отдаёт сигнал его завершения; nil — поколение сдвинулось.
@@ -689,11 +701,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// но без ссылки, и teardown его уже не отменил бы
 		guard requested == generation else { return nil }
 		let (done, doneContinuation) = AsyncStream<Void>.makeStream()
-		// detached по той же причине, что и inputTask: Task {} внутри актора
-		// наследует его изоляцию, и весь покадровый разбор — switch, ledger,
-		// yield — исполнялся бы на сериальном экзекьюторе актора, конкурируя
-		// с cancel(), invalidate() и сбором кук следующего стрима. Изоляция
-		// нужна ровно двум вызовам ниже, и они берут её сами
+		// detached по той же причине, что и inputTask: покадровый разбор —
+		// switch, ledger, yield — иначе шёл бы через сериальный экзекьютор
+		// актора. Изоляция нужна ровно двум вызовам ниже, и они берут её сами
 		let reader = Task.detached { [weak self] in
 			// Сигнал завершения — от самого читателя: ожидание в drainOutput
 			// становится отменяемым, промежуточный waiter не нужен
@@ -990,11 +1000,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// прочитались, и рукопожатие уходило бы вовсе без авторизации
 		let (signal, signalContinuation) = AsyncStream<ReservedCookieRead>.makeStream()
 
-		// detached по той же причине, что inputTask и outputTask: Task {} внутри
-		// актора наследует изоляцию и держит его СИЛЬНО, а зависшее чтение
-		// (кейчейн на заблокированном устройстве — тот самый сценарий, ради
-		// которого тут дедлайн) тогда не давало бы актору деинициализироваться,
-		// и сокет с сессией текли бы до конца процесса
+		// detached: тела не трогают актора вовсе, и зависшее чтение (кейчейн на
+		// заблокированном устройстве — тот самый сценарий, ради которого тут
+		// дедлайн) не должно занимать его очередь
 		let fetches = names.map { name in
 			Task.detached {
 				let value = await storage.getCookie(name: name)
@@ -1275,7 +1283,16 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			completionHandler(nil)
 			return
 		}
-		completionHandler(request)
+		// Запрос пересобрала Foundation: наши инварианты в нём не гарантированы.
+		// Возвращаем оба — иначе URLSession подставит куки из shared-стоража, и
+		// чужая sessionid подменит авторизацию SDK в обход фильтра имён
+		var forwarded = request
+		forwarded.httpShouldHandleCookies = false
+		forwarded.setValue(
+			task.originalRequest?.value(forHTTPHeaderField: "Cookie"),
+			forHTTPHeaderField: "Cookie"
+		)
+		completionHandler(forwarded)
 	}
 
 	func urlSession(
