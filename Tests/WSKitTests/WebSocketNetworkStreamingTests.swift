@@ -1442,17 +1442,22 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		// Ограничения по кадрам мало: 1024 кадра по мегабайту это гигабайт,
 		// которого iOS не переживёт. Крупные кадры должны упереться в байтовый
 		// бюджет заметно раньше, чем в счётчик кадров
-		let ws = await makeStreaming(timeout: 20)
+		// Окно «никто не читает» широкое намеренно: бюджет обязан набраться
+		// именно в нём. Как только потребитель начинает вычитывать, очередь
+		// расходится и порог не берётся — это правильное поведение, но тогда
+		// тест меряет скорость канала, а не границу. На macOS 8 МиБ успевали
+		// за 4с, на симуляторе iOS нет, и тест падал там на ровном месте
+		let ws = await makeStreaming(timeout: 30)
 		let stream = try await openStream(ws, path: "/flood-big")
-		try await Task.sleep(nanoseconds: 4_000_000_000)
+		try await Task.sleep(nanoseconds: 14_000_000_000)
 
-		let result = await drain(stream, deadline: 10)
+		let result = await drain(stream, deadline: 25)
 		XCTAssertTrue(result.completed)
 		guard case .nsError(let inner)? = result.thrown as? NetworkStreamingError else {
 			return XCTFail("Ожидали .nsError переполнения, получили \(String(describing: result.thrown))")
 		}
 		XCTAssertEqual(inner.code, NSURLErrorDataLengthExceedsMaximum)
-		XCTAssertGreaterThan(result.events.count, 50)
+		XCTAssertGreaterThan(result.events.count, 10)
 		XCTAssertLessThan(result.events.count, 1024,
 			"Сработать должен байтовый бюджет, а не счётчик кадров")
 		await ws.cancel()

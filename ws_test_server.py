@@ -62,8 +62,12 @@ async def handler(ws):
             await asyncio.sleep(10)
             await ws.close(code=1000)
         elif path == "/flood-big":
-            chunk = b"y" * (64 * 1024)
-            for i in range(600):
+            # Кадры крупные намеренно: байтовый бюджет должен набраться за
+            # десяток сообщений, а не за сотню. Симулятор iOS медленнее
+            # раннера, и тест, зависящий от «успеет ли прийти 8 МиБ»,
+            # проходил на macOS и падал на iOS
+            chunk = b"y" * (256 * 1024)
+            for i in range(400):
                 await ws.send(chunk)
             await asyncio.sleep(10)
             await ws.close(code=1000)
