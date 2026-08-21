@@ -975,7 +975,7 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		task: URLSessionTask,
 		willPerformHTTPRedirection response: HTTPURLResponse,
 		newRequest request: URLRequest,
-		completionHandler: @escaping (URLRequest?) -> Void
+		completionHandler: @Sendable @escaping (URLRequest?) -> Void
 	) {
 		guard let target = request.url, isSameOrigin(target) else {
 			Logger.assistant.error(S("WebSocket handshake redirect refused"))

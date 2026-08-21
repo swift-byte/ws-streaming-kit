@@ -1104,11 +1104,15 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testRedirectGuardIsReachedThroughProtocolDispatch() async throws {
-		// Тест на диспетчеризацию, а не на логику: делегат ставится в
-		// task.delegate и вызывается платформой через URLSessionTaskDelegate.
-		// Если сигнатура перестанет удовлетворять требованию протокола,
-		// сработает дефолтная реализация — редирект пойдёт, а гард промолчит
+		// Тест на диспетчеризацию, а не на логику: платформа зовёт делегата не
+		// по конкретному типу, а через URLSessionTaskDelegate. Механизм у
+		// платформ разный, поэтому и проверка разная — но смысл один: если
+		// сигнатура перестанет удовлетворять требованию протокола, гард
+		// молча выключится и редирект пойдёт с куками SDK
 		let (delegate, stream, session, task) = makeDelegatePair()
+		#if canImport(FoundationNetworking)
+		// corelibs: чистый Swift-протокол, требование обязательное —
+		// вызываем через существующий тип и ждём отказа
 		let dispatched: URLSessionTaskDelegate = delegate
 		let response = HTTPURLResponse(
 			url: URL(string: "https://origin.example/stream")!,
@@ -1117,7 +1121,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 			headerFields: nil
 		)!
 		let redirected = URLRequest(url: URL(string: "https://attacker.example/stream")!)
-
 		let followed: URLRequest? = await withCheckedContinuation { continuation in
 			dispatched.urlSession(
 				session,
@@ -1130,6 +1133,22 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertNil(followed, "Гард должен вызываться через протокол, а не только напрямую")
 		let result = await drain(stream, deadline: 1)
 		XCTAssertNotNil(result.thrown)
+		#else
+		// Darwin: @objc-протокол, метод опциональный — платформа сначала
+		// спрашивает responds(to:). Селектора нет — метод не выставлен в ObjC,
+		// и URLSession просто пойдёт по редиректу сама
+		_ = stream
+		_ = session
+		_ = task
+		XCTAssertTrue(
+			delegate.responds(
+				to: #selector(
+					URLSessionTaskDelegate.urlSession(_:task:willPerformHTTPRedirection:newRequest:completionHandler:)
+				)
+			),
+			"Метод должен быть виден ObjC-рантайму, иначе редирект-гард мёртв"
+		)
+		#endif
 	}
 
 	func testDuplicateHeaderNameResolvesDeterministically() async throws {

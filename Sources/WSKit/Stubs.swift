@@ -77,10 +77,7 @@ extension KidsURLSession: URLSessionWebSocketDelegate, URLSessionTaskDelegate {
 
 	// ВНИМАНИЕ: форвардеры пишутся руками, обобщённого механизма нет. Новый
 	// метод URLSessionTaskDelegate в проде без парного форвардера здесь на
-	// Linux не вызовется вовсе — и молча. Сигнатура ниже помечена @Sendable,
-	// потому что требование протокола в corelibs такое: у прод-делегата она
-	// без @Sendable (так требует Darwin), и совместимость витнесса
-	// зафиксирована тестом testRedirectGuardIsReachedThroughProtocolDispatch
+	// Linux не вызовется вовсе — и молча
 	func urlSession(
 		_ session: URLSession,
 		task: URLSessionTask,
