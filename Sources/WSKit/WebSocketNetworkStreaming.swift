@@ -3,6 +3,12 @@ import Foundation
 import FoundationNetworking
 #endif
 
+/// Одно прочитанное имя из `Cookies`; `value` == nil — стораж ничего не отдал
+private struct ReservedCookieRead: Sendable {
+	let name: String
+	let value: String?
+}
+
 actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Private Types
@@ -23,6 +29,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		///   более чем на один кадр, то есть срабатывает раньше, а не позже
 		/// - Returns: вес очереди после учёта кадра
 		mutating func record(size: Int, depth: Int) -> Int {
+			// Инвариант держим сами, а не через политику буфера у вызывающего:
+			// отрицательная глубина увела бы голову за конец массива
+			let depth = max(0, depth)
 			sizes.append(size)
 			bytes += size
 			while sizes.count - head > depth {
@@ -73,11 +82,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// 1024 кадра по maximumMessageSize это уже гигабайт, который iOS не
 	/// переживёт; одних байтов мало — AsyncStream умеет ограничивать только
 	/// число элементов, и байтовый счёт снимается с его же remaining
-	/// Чтение кук должно быть мгновенным; столько ждать его уже патология
-	private static let cookieCollectionNanoseconds: UInt64 = 5_000_000_000
-
 	private static let outputBufferDepth = 1024
 	private static let outputBufferBytes = 8 * 1024 * 1024
+
+	/// Чтение кук должно быть мгновенным; столько ждать его уже патология
+	private static let cookieCollectionNanoseconds: UInt64 = 5_000_000_000
 
 	/// Платформенный дедлайн простоя — последняя страховка от соединения,
 	/// умершего без FIN: сокет, молчащий дольше, CFNetwork закроет сам, и
@@ -96,6 +105,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private let timeout: Int
 	private let allowsInsecureEndpoint: Bool
 	private let session: URLSession
+	/// Снимается при инициализации с того же объекта конфигурации, что получила
+	/// сессия: разойтись они не могут (сессия делает свой снимок там же), а
+	/// session.configuration отдаёт КОПИЮ конфигурации на каждое обращение
+	private let handshakeCookieStorage: HTTPCookieStorage?
 
 	private var generation = 0
 	private var currentToken: LifecycleToken?
@@ -110,6 +123,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	/// - Parameter timeout: секунды ожидания ПЕРВОГО входящего сообщения
 	///   (не только рукопожатия); значения вне 1...3600 клампятся к границам.
+	///   Отсчёт начинается ПОСЛЕ сбора кук, поэтому свой сторожевой таймер
+	///   вызывающему стоит ставить с запасом на `cookieCollectionNanoseconds`.
 	/// - Parameter allowsInsecureEndpoint: разрешает ws:// вне loopback.
 	///   Включать только там, где TLS терминируется вне приложения (on-prem,
 	///   стенд в приватной сети): SDK-куки пойдут открытым текстом. Решение
@@ -129,6 +144,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		let configuration = URLSessionConfiguration.default
 		configuration.httpCookieStorage = .shared
 		configuration.timeoutIntervalForRequest = Self.platformRequestTimeout(for: self.timeout)
+		handshakeCookieStorage = configuration.httpCookieStorage
 		session = URLSession(
 			configuration: configuration,
 			delegate: kidsURLSession,
@@ -340,14 +356,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///
 	/// В протокол `NetworkStreaming` не входит — доступен по конкретному типу.
 	func invalidate() {
-		disarmTimeout(generation: generation)
+		disarmTimeout()
 	}
 
 	/// Разоружение коммитится в том же изолированном шаге, что и отмена
 	/// хэндла: иначе оставалось окно в один хоп, где уже проснувшийся таймер
-	/// добегал до fireTimeout и рвал стрим после снятия страховки
-	private func disarmTimeout(generation requested: Int) {
-		guard requested == generation else { return }
+	/// добегал до fireTimeout и рвал стрим после снятия страховки.
+	/// Проверки поколения здесь нет намеренно: все вызывающие либо сами уже
+	/// его сверили, либо разоружают текущее
+	private func disarmTimeout() {
 		isTimeoutArmed = false
 		timer?.cancel()
 		timer = nil
@@ -472,7 +489,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Опоздавший байт отсекает поколение: fireTimeout двигает его в том же
 		// изолированном шаге, что и решение о таймауте
 		guard requested == generation else { return false }
-		disarmTimeout(generation: requested)
+		disarmTimeout()
 		return true
 	}
 
@@ -571,7 +588,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func noteUplinkFailure(generation requested: Int, error: NSError) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
-		disarmTimeout(generation: requested)
+		disarmTimeout()
 	}
 
 	/// Заводит читателя и отдаёт сигнал его завершения; nil — поколение сдвинулось.
@@ -798,11 +815,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// last-wins сервер и примет, то есть ровно в обход фильтра по имени.
 		// Одноимённые упорядочены по возрастанию специфичности, побеждает
 		// последняя. Порядок тотальный — sort в Swift нестабилен
-		// Источник кук берём из конфигурации сессии, а не из .shared напрямую:
-		// иначе правка configuration.httpCookieStorage развела бы то, чем
-		// оперирует URLSession, и то, что мы кладём в заголовок
-		let storage = session.configuration.httpCookieStorage
-		let storedCookies = (storage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
+		let storedCookies = (handshakeCookieStorage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
 			.filter { Self.reservedCookieNames.contains($0.name.lowercased()) == false }
 			.filter { cookie in
 				guard Self.isSerializableCookie(name: cookie.name, value: cookie.value) else {
@@ -856,39 +869,41 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// сервер его отклонит, и это определённый исход, а не вечное ожидание
 	private func fetchReservedCookies() async -> [String: String] {
 		let storage = cookieStorage
-		let (signal, signalContinuation) = AsyncStream<[String: String]?>.makeStream()
+		let names = Cookies.allCases.map(\.rawValue)
+		// Каждое чтение публикуется своим сообщением, а не общим результатом:
+		// иначе одна зависшая кука уносила бы по дедлайну и те, что уже
+		// прочитались, и рукопожатие уходило бы вовсе без авторизации
+		let (signal, signalContinuation) = AsyncStream<ReservedCookieRead>.makeStream()
 
-		let fetch = Task {
-			var fetched = [String: String]()
-			await withTaskGroup(of: (String, String?).self) { group in
-				for cookie in Cookies.allCases {
-					group.addTask { (cookie.rawValue, await storage.getCookie(name: cookie.rawValue)) }
-				}
-				for await (name, value) in group {
-					fetched[name] = value
-				}
+		let fetches = names.map { name in
+			Task {
+				let value = await storage.getCookie(name: name)
+				signalContinuation.yield(ReservedCookieRead(name: name, value: value))
 			}
-			signalContinuation.yield(fetched)
-			signalContinuation.finish()
 		}
+		// Дедлайн закрывает сигнальный стрим — цикл заканчивается тем, что
+		// успело прийти, а недочитанное видно по остатку счётчика
 		let deadline = Task {
 			try? await Task.sleep(nanoseconds: Self.cookieCollectionNanoseconds)
-			signalContinuation.yield(nil)
 			signalContinuation.finish()
 		}
 		defer {
-			fetch.cancel()
+			fetches.forEach { $0.cancel() }
 			deadline.cancel()
+			signalContinuation.finish()
 		}
 
-		for await fetched in signal {
-			guard let fetched else {
-				Logger.assistant.error(S("Cookie collection timed out, handshake goes out unauthenticated"))
-				return [:]
-			}
-			return fetched
+		var fetched = [String: String]()
+		var pending = names.count
+		for await item in signal {
+			if let value = item.value { fetched[item.name] = value }
+			pending -= 1
+			if pending == 0 { break }
 		}
-		return [:]
+		if pending > 0 {
+			Logger.assistant.error(S("Cookie collection timed out after \(fetched.count)/\(names.count)"))
+		}
+		return fetched
 	}
 
 	/// Специфичность куки по RFC 6265 5.4: сперва длина path, при равной —
