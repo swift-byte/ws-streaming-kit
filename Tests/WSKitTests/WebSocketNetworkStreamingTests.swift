@@ -255,12 +255,20 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		}
 		XCTAssertEqual(payload.code, .internalServerError)
 
-		// Чистые коды сервера — тихий финиш, даже с ошибкой в паре
+		// Чистый код в паре с ошибкой словом сервера НЕ считается: платформа
+		// выставляет его и там, где close-фрейма не было (замерено: corelibs
+		// отдаёт 1000 на обрыве TCP). Настоящее чистое закрытие приезжает
+		// через didCloseWith и финиширует раньше, без ошибки в паре
 		for clean: URLSessionWebSocketTask.CloseCode in [.normalClosure, .noStatusReceived] {
-			XCTAssertNil(Delegate.completionOutcome(closeCode: clean, error: lost), "closeCode: \(clean)")
+			guard case .timeout? = Delegate.completionOutcome(closeCode: clean, error: lost) else {
+				return XCTFail("closeCode \(clean) с ошибкой: ожидали унаследованный .timeout")
+			}
+			XCTAssertNil(Delegate.completionOutcome(closeCode: clean, error: nil), "closeCode: \(clean)")
 		}
 
-		// Локальные сентинелы кодом сервера не являются — решает ошибка
+		// Локальные сентинелы кодом сервера не являются — решает ошибка.
+		// didCloseWith по ним вообще молчит (см. isPeerCloseCode), чтобы один
+		// и тот же обрыв не давал .closeCode или .timeout по гонке
 		for local: URLSessionWebSocketTask.CloseCode in [.invalid, .abnormalClosure, .tlsHandshakeFailure] {
 			guard case .timeout? = Delegate.completionOutcome(closeCode: local, error: lost) else {
 				return XCTFail("closeCode \(local): ожидали унаследованный .timeout")
@@ -280,14 +288,27 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	}
 
 	func testDelegateCleanCloseCodesFinishWithoutError() async {
-		// Сбоем не считаются 1000; 1005 — «кода не было», легальный исход по
-		// RFC 6455 §7.1.5; .invalid — сентинел «код не записан»
-		for closeCode: URLSessionWebSocketTask.CloseCode in [.normalClosure, .noStatusReceived, .invalid] {
+		// Сбоем не считаются 1000 и 1005 — «кода во фрейме не было», легальный
+		// исход по RFC 6455 §7.1.5
+		for closeCode: URLSessionWebSocketTask.CloseCode in [.normalClosure, .noStatusReceived] {
 			let (delegate, stream, session, task) = makeDelegatePair()
 			delegate.urlSession(session, webSocketTask: task, didCloseWith: closeCode, reason: nil)
 			let result = await drain(stream, deadline: 1)
 			XCTAssertTrue(result.completed, "closeCode: \(closeCode)")
 			XCTAssertNil(result.thrown, "closeCode: \(closeCode)")
+		}
+	}
+
+	func testDelegateStaysSilentOnLocallySetCloseFrameCode() async {
+		// 1006/1015 в close-фрейме запрещены (RFC 6455 §7.4.1): если платформа
+		// сообщает их через didCloseWith, причину знает didCompleteWithError,
+		// и она приедет следом. Финишировать раньше нельзя — тот же обрыв
+		// давал бы .closeCode или .timeout в зависимости от гонки
+		for local: URLSessionWebSocketTask.CloseCode in [.invalid, .abnormalClosure, .tlsHandshakeFailure] {
+			let (delegate, stream, session, task) = makeDelegatePair()
+			delegate.urlSession(session, webSocketTask: task, didCloseWith: local, reason: nil)
+			let result = await drain(stream, deadline: 0.3)
+			XCTAssertFalse(result.completed, "closeCode \(local): делегат должен промолчать")
 		}
 	}
 

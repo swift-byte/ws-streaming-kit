@@ -221,10 +221,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///   (Connection, Upgrade, Host, Content-Length, Transfer-Encoding,
 	///   Sec-WebSocket-*, Cookie) либо это регистронезависимый дубль. Каждый
 	///   случай логируется — молча не теряется ничего.
-	/// - Сбой отправки во входном стриме закрывает соединение и пишется в лог
-	///   (домен и код), но СВОИМ исходом не становится — почему именно, см.
-	///   `noteUplinkFailure`. Цена размена: если транспорт завершился чисто,
-	///   обрыв аплинка виден только в логе.
+	/// - Сбой отправки во входном стриме пишется в лог (домен и код), но СВОИМ
+	///   исходом не становится — почему именно, см. `noteUplinkFailure`.
+	///   Соединение при этом не закрывается: транспорт уже кончился и назовёт
+	///   причину сам. Исключение — сбой отправки терминатора: там сервер иначе
+	///   ждал бы ввод вечно, и сокет закрываем мы.
 	/// - Сбор кук ограничен своим дедлайном: по его истечении рукопожатие
 	///   уходит без авторизации, но `establishStream` не зависает.
 	/// - Если `cookieStorage` не отдал зарезервированную куку, рукопожатие уйдёт
@@ -460,9 +461,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		if canonical == "localhost" || canonical == "::1" || canonical == "0:0:0:0:0:0:0:1" {
 			return true
 		}
+		// 127.1 и 127.0.1 — те же формы, что разворачивает системный резолвер,
+		// а первый октет сравнивается числом: «0127» тоже 127
 		let octets = canonical.split(separator: ".", omittingEmptySubsequences: false)
-		guard octets.count == 4, octets.allSatisfy({ UInt8($0) != nil }) else { return false }
-		return octets[0] == "127"
+		guard (2...4).contains(octets.count), octets.allSatisfy({ UInt8($0) != nil }) else { return false }
+		return UInt8(octets[0]) == 127
 	}
 
 	// MARK: - Private Methods
@@ -586,9 +589,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		inputTask = Task.detached { [weak self] in
 			/// Проверка отсекает штатный teardown: сокет рвётся раньше, чем send
 			/// видит отмену, и это не сбой аплинка
-			func noteSendFailure(_ error: Error) async {
+			func noteSendFailure(_ error: Error, closing: Bool) async {
 				guard Task.isCancelled == false else { return }
-				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
+				await self?.noteUplinkFailure(generation: requested, error: error as NSError, closing: closing)
 			}
 
 			var sendFailed = false
@@ -603,7 +606,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// CFNetwork. Наша отмена, успей она первой, подменила бы её
 					// на -999, а тот делегат считает чистым завершением —
 					// реальный обрыв связи стал бы тихим финишем
-					await noteSendFailure(error)
+					await noteSendFailure(error, closing: false)
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
@@ -614,7 +617,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				// А здесь закрываем: без терминатора сервер продолжает добирать
 				// аплинк и может не ответить вовсе. Ждать тут нечего, поэтому
 				// риск подменить причину оправдан
-				await noteSendFailure(error)
+				await noteSendFailure(error, closing: true)
 				guard Task.isCancelled == false else { return }
 				task.cancel()
 			}
@@ -642,10 +645,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// SDK, и вводить его надо синхронно с вызывающим кодом.
 	/// Страховку снимаем — соединение уже рвётся, и таймаут, выстрелив в окне
 	/// дренажа, подменил бы причину
-	private func noteUplinkFailure(generation requested: Int, error: NSError) {
+	/// - Parameter closing: закрываем ли мы сокет вслед за этим. Страховку
+	///   снимаем только тогда: иначе таймаут гонялся бы с нашим же teardown.
+	///   Когда сокет остаётся жить, дедлайн — единственное, что не даст
+	///   обречённому стриму висеть до платформенного
+	private func noteUplinkFailure(generation requested: Int, error: NSError, closing: Bool) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
-		disarmTimeout()
+		if closing { disarmTimeout() }
 	}
 
 	/// Заводит читателя и отдаёт сигнал его завершения; nil — поколение сдвинулось.
@@ -672,6 +679,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			var isFirstMessage = true
 			var warnedTextFrame = false
 			var warnedUnknownFrame = false
+			var warnedUnknownYield = false
 			var ledger = OutputQueueLedger()
 			do {
 				while Task.isCancelled == false {
@@ -736,9 +744,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						// Стрим уже завершён кем-то ещё — читать больше некому
 						return
 					@unknown default:
-						// Доставлен кадр или нет — неизвестно, а «молча терять
-						// кадры нельзя»: падаем в ту же ветку, что и .dropped
-						break
+						// Доставлен кадр или нет — неизвестно. Рвать рабочий
+						// стрим по неизвестному случаю хуже, чем продолжить:
+						// диагноз «переполнение» был бы выдуманным. Молчать
+						// тоже нельзя — логируем, один раз
+						if warnedUnknownYield == false {
+							warnedUnknownYield = true
+							Logger.assistant.error(S("Unknown yield result, frame delivery unverified"))
+						}
+						continue
 					}
 					// Молча терять кадры нельзя: стрим падает наблюдаемо
 					Logger.assistant.error(S("Output buffer overflow: consumer is not draining"))
@@ -800,15 +814,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						// .connected выдаётся одним изолированным шагом с проверкой
 						// поколения; reader создаётся после yield, иначе .received
 						// мог бы обогнать .connected
-						guard await self?.yieldConnectedIfCurrent(
-							generation: requested,
-							outputContinuation: outputContinuation
-						) == true else {
-							continue
-						}
 						// self связывается на время настройки — окно короткое и
 						// заканчивается вместе с этим блоком, актор оно не удержит
-						guard let self else { continue }
+						guard let self, await self.yieldConnectedIfCurrent(
+							generation: requested,
+							outputContinuation: outputContinuation
+						) else {
+							continue
+						}
 						guard let created = await self.createOutputTask(
 							generation: requested,
 							task: task,
@@ -901,7 +914,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				}
 				return true
 			}
-			.sorted { Self.specificity(of: $0) < Self.specificity(of: $1) }
+			.map { (key: Self.specificity(of: $0), cookie: $0) }
+			.sorted { $0.key < $1.key }
+			.map(\.cookie)
 		for cookie in storedCookies {
 			merged[cookie.name] = cookie
 		}
@@ -1011,8 +1026,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {
-		guard Self.isSerializableCookie(name: name, value: value) else {
-			Logger.assistant.error(S("Cookie rejected for \(Self.logSafe(name)): control characters or separators"))
+		// Имя и значение отбраковываются по разным правилам, поэтому и в логе
+		// разделены: иначе диагностика вела бы не к той половине пары
+		guard Self.isToken(name) else {
+			Logger.assistant.error(S("Cookie rejected, name is not a token: \(Self.logSafe(name))"))
+			return nil
+		}
+		guard Self.isCookieOctets(value) else {
+			Logger.assistant.error(S("Cookie rejected, value has control characters or separators: \(Self.logSafe(name))"))
 			return nil
 		}
 		let cookie = HTTPCookie(properties: [
@@ -1166,6 +1187,10 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
 		reason: Data?
 	) {
+		// Локальные сентинелы (1006/1015) сервер прислать не мог: настоящую
+		// причину знает didCompleteWithError, и она приедет следом. Молчим,
+		// иначе тот же обрыв давал бы .closeCode или .timeout по гонке
+		guard Self.isPeerCloseCode(closeCode) else { return }
 		continuation.finish(throwing: Self.closeFrameOutcome(closeCode))
 	}
 
@@ -1174,10 +1199,10 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 	/// сторона, когда фрейм пришёл БЕЗ кода; закрытие при этом состоялось,
 	/// поэтому сбоем оно не считается. Это осознанное отличие от исходной
 	/// версии, где 1005 приезжал ошибкой.
-	/// .invalid — «код не записан»: сказать о сбое по нему нечего, поэтому
-	/// сбоем он тоже не считается
+	/// Вызывается только после `isPeerCloseCode`, поэтому локальные сентинелы
+	/// (включая .invalid) сюда не доходят и в перечислении не участвуют
 	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
-		closeCode == .normalClosure || closeCode == .noStatusReceived || closeCode == .invalid
+		closeCode == .normalClosure || closeCode == .noStatusReceived
 	}
 
 	/// Код, который мог прийти в close-фрейме от сервера. 1006 и 1015 по
@@ -1250,15 +1275,20 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		closeCode: URLSessionWebSocketTask.CloseCode,
 		error: NSError?
 	) -> NetworkStreamingError? {
-		if isPeerCloseCode(closeCode) { return closeFrameOutcome(closeCode) }
+		// Код с причиной перевешивает ошибку завершения: её сервер и объясняет.
+		// А вот ЧИСТЫЙ код — нет: платформа выставляет его и там, где фрейма не
+		// было (замерено: corelibs на обрыве TCP отдаёт 1000), и приняв его за
+		// слово сервера мы проглотили бы настоящую транспортную ошибку.
+		// Настоящее чистое закрытие приходит через didCloseWith и финиширует
+		// раньше — сюда с ошибкой в паре оно не доезжает
+		if isPeerCloseCode(closeCode), isCleanClosure(closeCode) == false {
+			return closeFrameOutcome(closeCode)
+		}
 		guard let error, isCleanTransportError(error) == false else { return nil }
 		return .transportFailure(error)
 	}
 
-	/// Исход по коду закрытия, о котором известно, что закрытие состоялось:
-	/// сюда приходят и локальные сентинелы (1006/1015), и молчать о них нельзя —
-	/// закрытие было ненормальным, а ошибка завершения приедет уже после
-	/// финиша и ничего не добавит (finish первый-выигрывает)
+	/// Исход по коду, пришедшему во фрейме: код и есть вся история
 	static func closeFrameOutcome(_ closeCode: URLSessionWebSocketTask.CloseCode) -> NetworkStreamingError? {
 		guard isCleanClosure(closeCode) == false else { return nil }
 		return .closeCode(NetworkStreamingOutputError(code: closeCode))
