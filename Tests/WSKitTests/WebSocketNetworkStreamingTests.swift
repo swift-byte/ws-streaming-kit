@@ -26,9 +26,15 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		super.tearDown()
 	}
 
+	/// Чистятся все домены, которыми пользуются тесты, а не только loopback:
+	/// example.com-фикстуры иначе держатся только на `defer` внутри теста и
+	/// переживают прерванный прогон, становясь предусловием следующего
+	private static let testCookieDomains = ["127.0.0.1", "example.com"]
+
 	private static func purgeLocalCookies() {
 		let storage = HTTPCookieStorage.shared
-		for cookie in storage.cookies ?? [] where cookie.domain.contains("127.0.0.1") {
+		for cookie in storage.cookies ?? [] {
+			guard testCookieDomains.contains(where: { cookie.domain.contains($0) }) else { continue }
 			storage.deleteCookie(cookie)
 		}
 	}
@@ -455,6 +461,62 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertNil(result.thrown,
 			"Штатное закрытие должно оставаться тихим и при активном вводе; получили \(String(describing: result.thrown))")
 		XCTAssertEqual(result.events.first, .connected)
+		await ws.cancel()
+	}
+
+	#if !canImport(FoundationNetworking)
+	func testAbruptTransportDropWhileSendingIsNotReportedAsSuccess() async throws {
+		// Сервер рвёт TCP без close-фрейма, пока идёт запись. Слово сервера тут
+		// не прозвучало, поэтому тихий финиш был бы для потребителя ложью:
+		// он не отличил бы обрыв записи от «сервер договорил».
+		// Только Darwin: corelibs на обрыве без фрейма подставляет closeCode
+		// 1000 (замерено) — то есть выдаёт разрыв за штатное закрытие, и
+		// отличить одно от другого там нечем
+		let ws = await makeStreaming(timeout: 20)
+		let (input, inputCont) = makeInput()
+		let stream = try await openStream(ws, path: "/abrupt-drop", input: input)
+		let feeder = feedInput(inputCont)
+
+		let result = await drain(stream, deadline: 15)
+		feeder.cancel()
+		inputCont.finish()
+
+		XCTAssertTrue(result.completed)
+		XCTAssertNotNil(result.thrown, "Обрыв без close-фрейма не должен выглядеть успехом")
+		await ws.cancel()
+	}
+	#endif
+
+	func testCancelledCallerAbortsEstablishInsteadOfOpeningAnonymousSocket() async throws {
+		// Сбор кук вычитывает сигнальный стрим, а тот под отменой отдаёт nil
+		// сразу: без явной проверки establishStream открывал бы сокет вообще
+		// без авторизации, и отказ сервера выглядел бы провалом логина
+		let storage = CookieStorage()
+		await storage.setArtificialDelay(nanoseconds: 500_000_000)
+		await storage.set("abc123", for: Cookies.session.rawValue)
+		let ws = WebSocketNetworkStreaming(
+			kidsURLSession: KidsURLSession(),
+			cookieStorage: storage,
+			timeout: 10
+		)
+		let (input, inputCont) = makeInput()
+		inputCont.finish()
+
+		let endpoint = wsBase + "/cookie"
+		let establish = Task {
+			try await ws.establishStream(endpoint: endpoint, headers: [:], inputStream: input)
+		}
+		try await Task.sleep(nanoseconds: 100_000_000)
+		establish.cancel()
+
+		do {
+			_ = try await establish.value
+			XCTFail("Ожидали CancellationError")
+		} catch is CancellationError {
+			// ожидаемо
+		} catch {
+			XCTFail("Ожидали CancellationError, получили \(error)")
+		}
 		await ws.cancel()
 	}
 

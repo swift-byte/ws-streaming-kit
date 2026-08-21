@@ -67,6 +67,11 @@ async def handler(ws):
                 await ws.send(chunk)
             await asyncio.sleep(10)
             await ws.close(code=1000)
+        elif path == "/abrupt-drop":
+            await ws.send(b"hi")
+            await asyncio.sleep(0.3)
+            ws.transport.abort()   # рвём TCP без close-фрейма
+            return
         elif path == "/silent":
             await asyncio.sleep(30)
         else:

@@ -87,6 +87,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// число элементов, и байтовый счёт снимается с его же remaining
 	private static let outputBufferDepth = 1024
 	private static let outputBufferBytes = 8 * 1024 * 1024
+	/// Политика буфера объявлена рядом с глубиной, потому что байтовый счёт
+	/// снимается с `remaining` и верен только для ограниченной политики:
+	/// у `.unbounded` remaining равен Int.max, глубина схлопнулась бы в ноль,
+	/// и байтовая граница молча перестала бы существовать
+	private static let outputBufferingPolicy = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>
+		.Continuation.BufferingPolicy.bufferingOldest(outputBufferDepth)
 
 	/// Чтение кук должно быть мгновенным; столько ждать его уже патология
 	private static let cookieCollectionNanoseconds: UInt64 = 5_000_000_000
@@ -116,6 +122,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private var generation = 0
 	private var currentToken: LifecycleToken?
 	private var isTimeoutArmed = true
+	private var uplinkFailure: NSError?
 	private var webSocketTask: URLSessionWebSocketTask?
 	private var outputTask: Task<Void, Never>?
 	private var inputTask: Task<Void, Never>?
@@ -237,7 +244,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		currentToken = lifecycleToken
 
 		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>
-			.makeStream(bufferingPolicy: .bufferingOldest(Self.outputBufferDepth))
+			.makeStream(bufferingPolicy: Self.outputBufferingPolicy)
 
 		// Потребитель бросил стрим — значит, соединение больше некому читать:
 		// закрываем его. Поколение в захвате делает хук безвредным для всех
@@ -278,13 +285,27 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		await addCookies(to: &request, for: url)
 
+		// Сбор кук вычитывает сигнальный стрим, а тот под отменой отдаёт nil
+		// сразу — на отменённой задаче куки не соберутся. Открывать в этом
+		// случае анонимный сокет (сервер его отклонит, и это будет выглядеть
+		// провалом авторизации) хуже, чем честно вернуть отмену
+		if Task.isCancelled {
+			outputContinuation.onTermination = nil
+			outputContinuation.finish()
+			cancel(generation: currentGeneration)
+			throw CancellationError()
+		}
+
 		guard generation == currentGeneration else {
 			// Пока собирали куки, поколение сдвинулось. Причину различаем по
 			// токену: вытеснение — CancellationError (ретрай-логика не должна
 			// путать замену со штатным закрытием), явная отмена — тихий finish,
 			// единый с контрактом поднятого стрима
 			outputContinuation.onTermination = nil
-			outputContinuation.finish(throwing: outcome(for: lifecycleToken, terminalError: nil))
+			// Сокета ещё нет, поэтому close-кода тоже: .invalid
+			outputContinuation.finish(
+				throwing: outcome(for: lifecycleToken, terminalError: nil, closeCode: .invalid)
+			)
 			return outputStream
 		}
 
@@ -345,9 +366,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Deadline Control
 
-	/// Снимает дедлайн ожидания первого входящего сообщения. Дедлайн тикает и
-	/// после `.connected`, так что снять его — единственный способ пережить
-	/// долгую паузу в диалоге.
+	/// Снимает дедлайн ожидания первого входящего сообщения у ТЕКУЩЕГО стрима.
+	/// Идентичности у стримов нет, как и у `cancel()`: вызов, разошедшийся с
+	/// новым `establishStream`, снимет страховку уже с нового стрима, и тот
+	/// будет ждать первого сообщения до платформенного дедлайна простоя.
+	/// Дедлайн тикает и после `.connected`, так что снять его — единственный
+	/// способ пережить долгую паузу в диалоге.
 	///
 	/// Платформенный дедлайн простоя при этом ОСТАЁТСЯ и снять его нечем:
 	/// соединение, молчащее дольше `platformRequestTimeout(for:)`, CFNetwork
@@ -449,6 +473,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// следующий стрим начинается со страховкой, а снятие, сделанное для
 		// прошлого, на него не переносится
 		isTimeoutArmed = true
+		uplinkFailure = nil
 		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
@@ -486,9 +511,22 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// разнесены внутри cancel(generation:), так что проверка Task.isCancelled
 	/// здесь проиграла бы гонку и вытеснение выглядело бы тихим финишем.
 	/// nil — тихий финиш
-	private func outcome(for token: LifecycleToken, terminalError: Error?) -> Error? {
+	private func outcome(
+		for token: LifecycleToken,
+		terminalError: Error?,
+		closeCode: URLSessionWebSocketTask.CloseCode
+	) -> Error? {
 		if token.superseded { return CancellationError() }
-		return terminalError
+		if let terminalError { return terminalError }
+		// Делегат промолчал — закрытие штатное. Но «штатное» бывает двух родов:
+		// сервер попрощался (код прислал он) или закрывались мы. Во втором
+		// случае, если закрывались из-за сбоя аплинка, это и есть причина —
+		// иначе обрыв записи выглядел бы для потребителя успехом
+		if let uplinkFailure,
+		   WebSocketNetworkStreamingDelegate.isPeerCloseCode(closeCode) == false {
+			return NetworkStreamingError.transportFailure(uplinkFailure)
+		}
+		return nil
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
@@ -559,12 +597,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// teardown мог закрыть сокет сам, и второе закрытие только
 					// перебило бы его код своим
 					guard Task.isCancelled == false else { return }
-					// .normalClosure, а не .goingAway: закрытие по своей
-					// инициативе выставляет closeCode задачи (замерено: 1001),
-					// а делегат считает код закрытия словом сервера. Чистый код
-					// не искажает картину; на проводе разницы нет — close-фрейм
-					// при cancel(with:) всё равно не доставляется
-					task.cancel(with: .normalClosure, reason: nil)
+					// cancel() без кода: любой code, выставленный своей
+					// инициативой, попал бы в closeCode задачи (замерено) и
+					// выдал бы наше закрытие за слово сервера — а по этому
+					// признаку `outcome` и отличает одно от другого.
+					// Close-фрейм при cancel(with:) всё равно не доставляется
+					task.cancel()
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
@@ -578,22 +616,23 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				guard Task.isCancelled == false else { return }
 				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
 				guard Task.isCancelled == false else { return }
-				task.cancel(with: .normalClosure, reason: nil)
+				task.cancel()
 			}
 		}
 	}
 
-	/// Сбой отправки — симптом, а не причина: send падает ровно тогда, когда
-	/// транспорт уже кончился, а исход транспорта называет делегат, и только он
-	/// видит close-код сервера. Поэтому здесь остаётся лог, а не собственный
-	/// finish: тот выигрывал гонку у didCloseWith и подменял исход (замерено:
-	/// с активным вводом /close1011 отдавал .timeout вместо closeCode(1011),
-	/// а штатный /close1000 — .timeout вместо тихого финиша; 6/6 и 8/8).
+	/// Причина сбоя отправки ЗАПОМИНАЕТСЯ, но не публикуется: собственный finish
+	/// выигрывал гонку у didCloseWith и подменял исход (замерено: с активным
+	/// вводом /close1011 отдавал .timeout вместо closeCode(1011), а штатный
+	/// /close1000 — .timeout вместо тихого финиша; 6/6 и 8/8 прогонов).
+	/// Запомненное всплывёт в `outcome`, только если делегат не назвал причину
+	/// И закрывались не по слову сервера.
 	/// Страховку снимаем: соединение уже рвётся, и таймаут, выстрелив в окне
 	/// дренажа, подменил бы причину точно так же
 	private func noteUplinkFailure(generation requested: Int, error: NSError) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
+		uplinkFailure = error
 		disarmTimeout()
 	}
 
@@ -785,10 +824,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// финишем не осталось точки приостановки. Снимаем же потому, что
 			// иначе финиш планирует Task с cancel() того же поколения, который
 			// следующей строкой отрабатывает и сам — хоп холостой
-			// ?? nil схлопывает двойную опциональность (актор мог уйти) в одну:
-			// без него `if let` снял бы лишь внешний уровень и «тихий финиш»
-			// стало бы невозможно отличить от «актора нет»
-			let outcome = await self?.outcome(for: lifecycleToken, terminalError: terminalError) ?? nil
+			// ?? terminalError схлопывает двойную опциональность: актор мог уйти
+			// за время дренажа, и тогда спросить его не о чем — но уже
+			// наблюдённая причина от этого не перестаёт быть причиной
+			let outcome = await self?.outcome(
+				for: lifecycleToken,
+				terminalError: terminalError,
+				closeCode: task.closeCode
+			) ?? terminalError
 			outputContinuation.onTermination = nil
 			outputContinuation.finish(throwing: outcome)
 			if Task.isCancelled == false {
