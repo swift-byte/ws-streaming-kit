@@ -765,7 +765,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	func testInsecureRemoteEndpointIsRejected() async throws {
 		// Транспорт без TLS вне loopback унёс бы SDK-куки открытым текстом
 		let ws = await makeStreaming()
-		for endpoint in ["ws://example.com/stream", "http://example.com/stream"] {
+		for endpoint in ["ws://example.com/stream", "ws://10.0.0.5:8901/stream"] {
 			let (input, cont) = makeInput()
 			cont.finish()
 			do {
@@ -783,14 +783,26 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		// ради проверки разбора строки незачем
 		for endpoint in [
 			"wss://example.com/stream",
-			"https://example.com/stream",
 			"ws://127.0.0.1:8901/echo",
-			"http://localhost:8901/echo"
+			"ws://127.0.0.2:8901/echo",
+			"ws://localhost:8901/echo",
+			"ws://localhost.:8901/echo",
+			"ws://[::1]:8901/echo"
 		] {
 			XCTAssertNoThrow(
 				try WebSocketNetworkStreaming.validate(endpoint: endpoint),
 				"endpoint: \(endpoint)"
 			)
+		}
+	}
+
+	func testHttpSchemesAreRejectedAsUnsupported() throws {
+		// Вебсокет-задача определена только на ws/wss; http:// рукопожатие
+		// просто не отвечает, и отказ пришёл бы уже после teardown
+		for endpoint in ["http://127.0.0.1:8901/echo", "https://example.com/stream"] {
+			XCTAssertThrowsError(try WebSocketNetworkStreaming.validate(endpoint: endpoint)) { error in
+				XCTAssertEqual((error as? URLError)?.code, .unsupportedURL, "endpoint: \(endpoint)")
+			}
 		}
 	}
 
@@ -1015,6 +1027,28 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Unit: делегат -> редиректы и close-коды
 
+	func testReservedHandshakeHeaderIsSkipped() async throws {
+		// Заголовки рукопожатия принадлежат транспорту: на Darwin Foundation
+		// вычистит их молча, на Linux — пропустит и сломает апгрейд. Отбраковка
+		// делает поведение одинаковым и видимым в логе
+		let ws = await makeStreaming(timeout: 10)
+		let stream = try await openStream(ws, path: "/headers", headers: [
+			"X-Kept": "yes",
+			"Sec-WebSocket-Protocol": "kids.v1",
+			"Content-Length": "9"
+		])
+		var iterator = stream.makeAsyncIterator()
+		_ = try await iterator.next() // .connected
+		guard case .received(let data)? = try await iterator.next() else {
+			return XCTFail("Ожидали дамп заголовков рукопожатия")
+		}
+		let dump = String(decoding: data, as: UTF8.self)
+		XCTAssertTrue(dump.contains("X-Kept: yes"), "Обычный заголовок должен доехать: \(dump)")
+		XCTAssertFalse(dump.contains("kids.v1"), "Sec-WebSocket-* принадлежит транспорту: \(dump)")
+		XCTAssertFalse(dump.lowercased().contains("content-length"), "Content-Length не наш: \(dump)")
+		await ws.cancel()
+	}
+
 	func testDelegateNoStatusCloseFinishesCleanly() async {
 		// 1005 — «кода не было», легальный исход по RFC 6455, а не сбой
 		let (delegate, stream, session, task) = makeDelegatePair()
@@ -1118,6 +1152,26 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(inner.code, NSURLErrorDataLengthExceedsMaximum)
 		XCTAssertEqual(result.events.first, .connected)
 		XCTAssertGreaterThan(result.events.count, 500, "Буферизованный префикс должен доехать до потребителя")
+		await ws.cancel()
+	}
+
+	func testOutputByteBudgetFailsStreamBeforeFrameCountBound() async throws {
+		// Ограничения по кадрам мало: 1024 кадра по мегабайту это гигабайт,
+		// которого iOS не переживёт. Крупные кадры должны упереться в байтовый
+		// бюджет заметно раньше, чем в счётчик кадров
+		let ws = await makeStreaming(timeout: 20)
+		let stream = try await openStream(ws, path: "/flood-big")
+		try await Task.sleep(nanoseconds: 4_000_000_000)
+
+		let result = await drain(stream, deadline: 10)
+		XCTAssertTrue(result.completed)
+		guard case .nsError(let inner)? = result.thrown as? NetworkStreamingError else {
+			return XCTFail("Ожидали .nsError переполнения, получили \(String(describing: result.thrown))")
+		}
+		XCTAssertEqual(inner.code, NSURLErrorDataLengthExceedsMaximum)
+		XCTAssertGreaterThan(result.events.count, 50)
+		XCTAssertLessThan(result.events.count, 1024,
+			"Сработать должен байтовый бюджет, а не счётчик кадров")
 		await ws.cancel()
 	}
 }

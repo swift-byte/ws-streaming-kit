@@ -70,6 +70,12 @@ async def handler(ws):
                 await ws.send(b"x" * 16)
             await asyncio.sleep(10)
             await ws.close(code=1000)
+        elif path == "/flood-big":
+            chunk = b"y" * (64 * 1024)
+            for i in range(600):
+                await ws.send(chunk)
+            await asyncio.sleep(10)
+            await ws.close(code=1000)
         elif path == "/silent":
             await asyncio.sleep(30)
         else:
