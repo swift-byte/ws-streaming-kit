@@ -201,7 +201,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 
 		var request = URLRequest(url: url)
-		for (key, value) in headers {
+		// Порядок обхода словаря не определён, а имена заголовков
+		// регистронезависимы: без сортировки и учёта уже занятых имён пара
+		// ["X-Trace": a, "x-trace": b] уходила бы на провод по-разному от
+		// запуска к запуску, и снова молча
+		var claimedHeaderNames = Set<String>()
+		for (key, value) in headers.sorted(by: { $0.key < $1.key }) {
 			guard Self.isToken(key), Self.isValidHeaderValue(value) else {
 				// Такую пару Foundation отбрасывает целиком и молча — без лога
 				// заголовка просто не окажется на проводе, и это никак не видно.
@@ -211,6 +216,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			}
 			guard Self.isReservedHeaderName(key) == false else {
 				Logger.assistant.error(S("Handshake header owned by URLSession, ignored: \(Self.logSafe(key))"))
+				continue
+			}
+			guard claimedHeaderNames.insert(key.lowercased()).inserted else {
+				Logger.assistant.error(S("Duplicate header name, ignored: \(Self.logSafe(key))"))
 				continue
 			}
 			request.setValue(value, forHTTPHeaderField: key)
@@ -271,8 +280,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return outputStream
 	}
 
-	/// Закрывает ТЕКУЩЕЕ соединение актора и отменяет его задачи; стрим
-	/// завершается тихим `finish()`. Идентичности у стримов нет — сигнатура
+	/// Закрывает ТЕКУЩЕЕ соединение актора и отменяет его задачи. Стрим
+	/// завершается тихо, если причина к этому моменту ещё не известна; уже
+	/// наблюдённая (close-код сервера, транспортная ошибка) сохраняется —
+	/// вызвавший отмену вправе её проигнорировать. Идентичности у стримов нет — сигнатура
 	/// унаследована от протокола, — поэтому вызов, разошедшийся с новым
 	/// `establishStream`, закроет уже новый стрим, и тот финиширует, не отдав
 	/// ни одного события; вызывающему стоит упорядочивать отмену и переподъём.
@@ -422,26 +433,31 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
 		guard requested == generation, isTimeoutArmed else { return }
-		// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
-		// с нашим teardown и мог перебить close-код .goingAway
-		outputContinuation.onTermination = nil
-		outputContinuation.finish(throwing: NetworkStreamingError.timeout)
-		delegateContinuation.finish(throwing: NetworkStreamingError.timeout)
-		cancel(generation: requested, closeCode: .goingAway)
+		failStream(
+			generation: requested,
+			outputContinuation: outputContinuation,
+			delegateContinuation: delegateContinuation,
+			error: .timeout
+		)
 	}
 
-	/// Аварийное завершение стрима: причина фиксируется, сокет закрывается
-	/// .goingAway — тем же путём, что и таймаут
-	private func failOutput(
+	/// Единственный путь аварийного завершения стрима. Причина фиксируется на
+	/// ОБЕИХ continuation до разрыва сокета: иначе гонка didClose/didComplete
+	/// успела бы подменить её на «сервер договорил». Закрываемся .goingAway,
+	/// а не .normalClosure — иначе сервер записал бы упавший стрим как
+	/// штатно завершённый клиентом.
+	/// Снятый onTermination убирает Task с cancel(.normalClosure), который
+	/// гонялся бы с нашим teardown и мог перебить close-код
+	private func failStream(
 		generation requested: Int,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
-		code: Int
+		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
+		error: NetworkStreamingError
 	) {
 		guard requested == generation else { return }
 		outputContinuation.onTermination = nil
-		outputContinuation.finish(
-			throwing: NetworkStreamingError.nsError(NSError(domain: NSURLErrorDomain, code: code))
-		)
+		outputContinuation.finish(throwing: error)
+		delegateContinuation.finish(throwing: error)
 		cancel(generation: requested, closeCode: .goingAway)
 	}
 
@@ -492,6 +508,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private func createOutputTask(
 		generation: Int,
 		task: URLSessionWebSocketTask,
+		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) -> AsyncStream<Void>? {
 		// Хоп отменённой connectTask всё равно исполняется: без guard'а поздний
@@ -559,14 +576,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					@unknown default:
 						continue
 					}
-					// Молча терять кадры нельзя: стрим падает наблюдаемо, а сокет
-					// закрывается .goingAway — иначе сервер записал бы 1000
-					// «клиент договорил» для упавшего стрима (паттерн fireTimeout)
+					// Молча терять кадры нельзя: стрим падает наблюдаемо
 					Logger.assistant.error(S("Output buffer overflow: consumer is not draining"))
-					await self?.failOutput(
+					await self?.failStream(
 						generation: generation,
 						outputContinuation: outputContinuation,
-						code: NSURLErrorDataLengthExceedsMaximum
+						delegateContinuation: delegateContinuation,
+						error: .nsError(
+							NSError(domain: NSURLErrorDomain, code: NSURLErrorDataLengthExceedsMaximum)
+						)
 					)
 					return
 				}
@@ -631,6 +649,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						guard let created = await self.createOutputTask(
 							generation: generation,
 							task: task,
+							delegateContinuation: delegateContinuation,
 							outputContinuation: outputContinuation
 						) else {
 							// Отказ означает teardown в окне хопа: ранний return
@@ -712,12 +731,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			merged[cookie.name] = cookie
 		}
 
-		// Запросы независимы, поэтому идут одной пачкой: последовательные await
-		// стоили бы N задержек стоража и, что важнее, N точек приостановки —
-		// каждая расширяет окно, в котором конкурентный establish/cancel
-		// обесценит уже собранный запрос
-		for (name, value) in await fetchReservedCookies() {
-			guard let value else {
+		// Один await на все зарезервированные куки. Дело не в параллелизме —
+		// стораж всё равно актор, — а в числе точек приостановки: каждая
+		// расширяет окно, в котором конкурентный establish/cancel обесценит
+		// уже собранный запрос. Обход идёт по allCases, а не по результату,
+		// чтобы порядок не зависел от того, кто финишировал первым
+		let fetched = await fetchReservedCookies()
+		for name in Cookies.allCases.map(\.rawValue) {
+			guard let value = fetched[name] else {
 				// Рукопожатие уйдёт без авторизации, и сервер закроет его сам —
 				// без этого лога причина отказа неотличима от серверной
 				Logger.assistant.error(S("Missing SDK cookie: \(name)"))
@@ -738,19 +759,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
-	/// Результат упорядочен по имени: задачи финишируют в произвольном порядке,
-	/// а заголовок должен собираться одинаково от запуска к запуску
-	private func fetchReservedCookies() async -> [(name: String, value: String?)] {
+	private func fetchReservedCookies() async -> [String: String] {
 		let storage = cookieStorage
 		return await withTaskGroup(of: (String, String?).self) { group in
 			for cookie in Cookies.allCases {
 				group.addTask { (cookie.rawValue, await storage.getCookie(name: cookie.rawValue)) }
 			}
-			var fetched = [(name: String, value: String?)]()
+			var fetched = [String: String]()
 			for await (name, value) in group {
-				fetched.append((name, value))
+				fetched[name] = value
 			}
-			return fetched.sorted { $0.name < $1.name }
+			return fetched
 		}
 	}
 
@@ -903,11 +922,13 @@ extension NetworkStreamingError {
 
 final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
 
-	private let origin: URL
+	/// Origin нормализуется один раз: он неизменен всё время жизни делегата,
+	/// а цепочка редиректов дёргала бы разбор на каждом хопе
+	private let origin: (scheme: String, host: String, port: Int?)?
 	private let continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 
 	init(origin: URL, continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation) {
-		self.origin = origin
+		self.origin = Self.normalizedOrigin(of: origin)
 		self.continuation = continuation
 	}
 
@@ -932,9 +953,12 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		continuation.finish()
 	}
 
-	/// 1005 — «кода не было», легальный исход по RFC 6455 §7.1.5, а не сбой
+	/// Сбоем не считаются: 1000, 1005 («кода не было» — легальный исход по
+	/// RFC 6455 §7.1.5) и .invalid — сентинел «код не записан». Последний
+	/// раньше расходился между ветками: didCloseWith отдавал по нему
+	/// бессмысленный .closeCode(0), а восстановление кода — чистый финиш
 	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
-		closeCode == .normalClosure || closeCode == .noStatusReceived
+		closeCode == .normalClosure || closeCode == .noStatusReceived || closeCode == .invalid
 	}
 }
 
@@ -971,31 +995,22 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		didCompleteWithError error: Error?
 	) {
 		guard let error = error as NSError? else {
-			// Терминальное событие без ошибки: если CFNetwork потерял didCloseWith,
-			// abnormal-код восстанавливаем из задачи (симметрично ветке ENOTCONN)
-			if let closeError = recoveredCloseError(from: task) {
-				continuation.finish(throwing: closeError)
-				return
-			}
-			continuation.finish()
+			// Терминальное событие без ошибки
+			finishRecoveringCloseCode(from: task)
 			return
 		}
 		if error.domain == NSURLErrorDomain && error.code == NSURLErrorCancelled {
-			// Соединение закрыли мы сами (в т.ч. отмена задач в deinit) —
-			// для потребителя это не ошибка
-			continuation.finish()
+			// Закрыли мы сами (в т.ч. отмена задач в deinit) — для потребителя
+			// это не ошибка. Но код, который сервер успел прислать до нашего
+			// закрытия, всё равно спасаем: иначе он терялся бы вместе с
+			// недоставленным didCloseWith
+			finishRecoveringCloseCode(from: task)
 			return
 		}
 		if error.domain == NSPOSIXErrorDomain && error.code == Int(POSIXErrorCode.ENOTCONN.rawValue) {
 			// POSIX 57: сокет закрыт к моменту completion — финал гонки с
-			// close-фреймом. didCloseWith теряется безотносительно кода
-			// (замерено), код восстанавливаем из задачи. Истинные обрывы
-			// приходят NSURLError-кодами
-			if let closeError = recoveredCloseError(from: task) {
-				continuation.finish(throwing: closeError)
-				return
-			}
-			continuation.finish()
+			// close-фреймом. Истинные обрывы приходят NSURLError-кодами
+			finishRecoveringCloseCode(from: task)
 			return
 		}
 		// Унаследованный контракт SDK: потребители различают исходы по этим
@@ -1004,32 +1019,41 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 	}
 
 	private func isSameOrigin(_ target: URL) -> Bool {
-		let source = WebSocketNetworkStreaming.cookieMatchURL(for: origin)
-		let destination = WebSocketNetworkStreaming.cookieMatchURL(for: target)
-		guard let sourceScheme = source.scheme?.lowercased(),
-			  let destinationScheme = destination.scheme?.lowercased(),
-			  let sourceHost = source.host?.lowercased(),
-			  let destinationHost = destination.host?.lowercased() else {
-			return false
-		}
-		return sourceScheme == destinationScheme
-			&& sourceHost == destinationHost
-			&& Self.port(of: source) == Self.port(of: destination)
+		guard let origin, let destination = Self.normalizedOrigin(of: target) else { return false }
+		return origin == destination
 	}
 
-	private static func port(of url: URL) -> Int? {
-		if let port = url.port { return port }
-		switch url.scheme?.lowercased() {
-		case "https": return 443
-		case "http": return 80
-		default: return nil
+	/// Схема приводится к HTTP-виду (ws→http, wss→https): рукопожатие и его
+	/// редиректы живут в HTTP-схемах, порт по умолчанию берётся оттуда же
+	private static func normalizedOrigin(of url: URL) -> (scheme: String, host: String, port: Int?)? {
+		let normalized = WebSocketNetworkStreaming.cookieMatchURL(for: url)
+		guard let scheme = normalized.scheme?.lowercased(),
+			  let host = normalized.host?.lowercased() else {
+			return nil
 		}
+		let port: Int?
+		switch (normalized.port, scheme) {
+		case (let explicit?, _): port = explicit
+		case (nil, "https"): port = 443
+		case (nil, "http"): port = 80
+		default: port = nil
+		}
+		return (scheme, host, port)
 	}
 
-	private func recoveredCloseError(from task: URLSessionTask) -> NetworkStreamingError? {
-		guard let webSocketTask = task as? URLSessionWebSocketTask else { return nil }
-		let closeCode = webSocketTask.closeCode
-		guard closeCode != .invalid, Self.isCleanClosure(closeCode) == false else { return nil }
-		return NetworkStreamingError.closeCode(NetworkStreamingOutputError(code: closeCode))
+	/// Все три «чистые» ветки завершения различаются только поводом: сокет уже
+	/// закрыт, и спасти можно ровно одно — код закрытия, если didCloseWith не
+	/// доехал (замерено: теряется безотносительно кода)
+	private func finishRecoveringCloseCode(from task: URLSessionTask) {
+		guard let webSocketTask = task as? URLSessionWebSocketTask,
+			  Self.isCleanClosure(webSocketTask.closeCode) == false else {
+			continuation.finish()
+			return
+		}
+		continuation.finish(
+			throwing: NetworkStreamingError.closeCode(
+				NetworkStreamingOutputError(code: webSocketTask.closeCode)
+			)
+		)
 	}
 }

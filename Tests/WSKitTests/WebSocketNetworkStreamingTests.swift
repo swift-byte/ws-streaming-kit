@@ -1132,6 +1132,37 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertNotNil(result.thrown)
 	}
 
+	func testDuplicateHeaderNameResolvesDeterministically() async throws {
+		// Имена заголовков регистронезависимы, а порядок обхода словаря не
+		// определён: без сортировки пара уходила бы на провод по-разному от
+		// запуска к запуску. Побеждает первый по имени, второй — в лог
+		let ws = await makeStreaming(timeout: 10)
+		let stream = try await openStream(ws, path: "/headers", headers: [
+			"X-Trace": "first",
+			"x-trace": "second"
+		])
+		var iterator = stream.makeAsyncIterator()
+		_ = try await iterator.next() // .connected
+		guard case .received(let data)? = try await iterator.next() else {
+			return XCTFail("Ожидали дамп заголовков рукопожатия")
+		}
+		let dump = String(decoding: data, as: UTF8.self).lowercased()
+		XCTAssertTrue(dump.contains("x-trace: first"), "Дамп: \(dump)")
+		XCTAssertFalse(dump.contains("second"), "Второе значение должно быть отброшено: \(dump)")
+		await ws.cancel()
+	}
+
+	func testDelegateInvalidCloseCodeFinishesCleanly() async {
+		// .invalid — сентинел «код не записан», а не код 0: раньше didCloseWith
+		// отдавал по нему бессмысленный .closeCode(0), тогда как восстановление
+		// кода в didComplete тот же случай считало чистым финишем
+		let (delegate, stream, session, task) = makeDelegatePair()
+		delegate.urlSession(session, webSocketTask: task, didCloseWith: .invalid, reason: nil)
+		let result = await drain(stream, deadline: 1)
+		XCTAssertTrue(result.completed)
+		XCTAssertNil(result.thrown)
+	}
+
 	func testDelegateNoStatusCloseFinishesCleanly() async {
 		// 1005 — «кода не было», легальный исход по RFC 6455, а не сбой
 		let (delegate, stream, session, task) = makeDelegatePair()
