@@ -104,7 +104,7 @@ actor CookieStorage {
 	private var store: [String: String] = [:]
 	private var artificialDelayNanoseconds: UInt64 = 0
 
-	func set(_ value: String?, for name: String) {
+	func set(_ value: String, for name: String) {
 		store[name] = value
 	}
 

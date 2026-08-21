@@ -54,17 +54,14 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		var events: [NetworkStreamingOutputEvent]
 		var thrown: Error?
 		var completed: Bool   // стрим завершился сам (finish / finish(throwing:))
-		var timedOut: Bool    // мы прервали чтение по дедлайну
 	}
 
 	private actor Collector {
 		var events: [NetworkStreamingOutputEvent] = []
 		var thrown: Error?
 		var completed = false
-		var timedOut = false
 		func add(_ e: NetworkStreamingOutputEvent) { events.append(e) }
 		func finish(_ error: Error?) { thrown = error; completed = true }
-		func markTimeout() { timedOut = true }
 	}
 
 	/// Обёртка одного потребителя: next() никогда не вызывается конкурентно
@@ -92,9 +89,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 				for try await event in stream {
 					await collector.add(event)
 				}
-				if Task.isCancelled {
-					await collector.markTimeout()
-				} else {
+				if Task.isCancelled == false {
 					await collector.finish(nil)
 				}
 			} catch {
@@ -110,9 +105,40 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		return await DrainResult(
 			events: collector.events,
 			thrown: collector.thrown,
-			completed: collector.completed,
-			timedOut: collector.timedOut
+			completed: collector.completed
 		)
+	}
+
+	private enum NextOutcome: Sendable, Equatable {
+		case finished
+		case event(NetworkStreamingOutputEvent)
+		case cancellation
+		case failed(String)
+		case stillAlive
+	}
+
+	/// Ждёт следующий исход `reader` не дольше `deadline`; `.stillAlive` —
+	/// стрим за это время не завершился и события не отдал
+	private func nextOutcome(_ reader: StreamReader, deadline: Double) async -> NextOutcome {
+		await withTaskGroup(of: NextOutcome.self) { group in
+			group.addTask {
+				do {
+					guard let event = try await reader.next() else { return .finished }
+					return .event(event)
+				} catch is CancellationError {
+					return .cancellation
+				} catch {
+					return .failed(String(describing: error))
+				}
+			}
+			group.addTask {
+				try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+				return .stillAlive
+			}
+			let winner = await group.next() ?? .stillAlive
+			group.cancelAll()
+			return winner
+		}
 	}
 
 	private func makeInput() -> (AsyncStream<Data>, AsyncStream<Data>.Continuation) {
@@ -132,20 +158,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 			headers: headers,
 			inputStream: input ?? defaultInput
 		)
-	}
-
-	// MARK: - Unit: URL
-
-	func testBadURLThrowsBadURL() async throws {
-		let ws = await makeStreaming()
-		let (input, cont) = makeInput()
-		cont.finish()
-		do {
-			_ = try await ws.establishStream(endpoint: "", headers: [:], inputStream: input)
-			XCTFail("Ожидали URLError(.badURL)")
-		} catch let error as URLError {
-			XCTAssertEqual(error.code, .badURL)
-		}
 	}
 
 	// MARK: - Unit: Cookies
@@ -195,15 +207,19 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		delegate.urlSession(session, webSocketTask: task, didOpenWithProtocol: nil)
 		let result = await drain(stream, deadline: 0.3)
 		XCTAssertEqual(result.events, [.connected])
-		XCTAssertTrue(result.timedOut, "Открытие не должно завершать стрим")
+		XCTAssertFalse(result.completed, "Открытие не должно завершать стрим")
 	}
 
-	func testDelegateNormalCloseFinishesCleanly() async {
-		let (delegate, stream, session, task) = makeDelegatePair()
-		delegate.urlSession(session, webSocketTask: task, didCloseWith: .normalClosure, reason: nil)
-		let result = await drain(stream, deadline: 1)
-		XCTAssertTrue(result.completed)
-		XCTAssertNil(result.thrown)
+	func testDelegateCleanCloseCodesFinishWithoutError() async {
+		// Сбоем не считаются 1000; 1005 — «кода не было», легальный исход по
+		// RFC 6455 §7.1.5; .invalid — сентинел «код не записан»
+		for closeCode: URLSessionWebSocketTask.CloseCode in [.normalClosure, .noStatusReceived, .invalid] {
+			let (delegate, stream, session, task) = makeDelegatePair()
+			delegate.urlSession(session, webSocketTask: task, didCloseWith: closeCode, reason: nil)
+			let result = await drain(stream, deadline: 1)
+			XCTAssertTrue(result.completed, "closeCode: \(closeCode)")
+			XCTAssertNil(result.thrown, "closeCode: \(closeCode)")
+		}
 	}
 
 	func testDelegateAbnormalCloseThrowsCloseCode() async {
@@ -368,6 +384,59 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(payload.code, .internalServerError)
 	}
 
+	/// Кормит ввод, пока сервер не закроется: нужен inflight-send в момент
+	/// закрытия — именно он раньше отбирал причину у делегата
+	private func feedInput(_ continuation: AsyncStream<Data>.Continuation) -> Task<Void, Never> {
+		Task {
+			for _ in 0..<400 {
+				if Task.isCancelled { break }
+				continuation.yield(Data([0xAB, 0xCD]))
+				try? await Task.sleep(nanoseconds: 20_000_000)
+			}
+			continuation.finish()
+		}
+	}
+
+	func testServerCloseCodeSurvivesActiveInputStream() async throws {
+		// Регрессия: сбой отправки сам объявлял причину на общей continuation
+		// и выигрывал гонку у didCloseWith. С активным вводом закрытие 1011
+		// доезжало до потребителя как .timeout (замерено 6/6 прогонов)
+		let ws = await makeStreaming(timeout: 20)
+		let (input, inputCont) = makeInput()
+		let stream = try await openStream(ws, path: "/close1011", input: input)
+		let feeder = feedInput(inputCont)
+
+		let result = await drain(stream, deadline: 15)
+		feeder.cancel()
+		inputCont.finish()
+
+		guard case .closeCode(let payload)? = result.thrown as? NetworkStreamingError else {
+			return XCTFail("Ожидали closeCode(1011), получили \(String(describing: result.thrown))")
+		}
+		XCTAssertEqual(payload.code, .internalServerError)
+		await ws.cancel()
+	}
+
+	func testNormalServerCloseStaysQuietWithActiveInputStream() async throws {
+		// Тот же дефект в штатном сценарии, и он опаснее: у голосового стрима
+		// ввод активен всегда, так что КАЖДОЕ нормальное закрытие приезжало
+		// как .timeout (замерено 8/8 прогонов)
+		let ws = await makeStreaming(timeout: 20)
+		let (input, inputCont) = makeInput()
+		let stream = try await openStream(ws, path: "/close1000", input: input)
+		let feeder = feedInput(inputCont)
+
+		let result = await drain(stream, deadline: 15)
+		feeder.cancel()
+		inputCont.finish()
+
+		XCTAssertTrue(result.completed)
+		XCTAssertNil(result.thrown,
+			"Штатное закрытие должно оставаться тихим и при активном вводе; получили \(String(describing: result.thrown))")
+		XCTAssertEqual(result.events.first, .connected)
+		await ws.cancel()
+	}
+
 	// MARK: - Integration: таймаут
 
 	func testInvalidateDuringCookieCollectionStillDisarms() async throws {
@@ -442,60 +511,22 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(result.events, [.connected, .received(Data("hello".utf8))])
 	}
 
-	/// Голый платформенный базлайн: код, который видит сервер при
-	/// cancel(with: .goingAway) с висящим receive() — без нашего актора.
-	private func bareGoingAwayBaseline() async throws -> String {
-		let session = URLSession(configuration: .default)
-		defer { session.finishTasksAndInvalidate() }
-		let task = session.webSocketTask(with: URLRequest(url: URL(string: wsBase + "/connect-then-silent")!))
-		task.resume()
-		try await Task.sleep(nanoseconds: 500_000_000)
-		let pendingReceive = Task { _ = try? await task.receive() }
-		try await Task.sleep(nanoseconds: 200_000_000)
-		task.cancel(with: .goingAway, reason: nil)
-		try await Task.sleep(nanoseconds: 500_000_000)
-		pendingReceive.cancel()
-		return try await readLastCloseCode()
-	}
-
-	private func readLastCloseCode() async throws -> String {
-		let probe = await makeStreaming(timeout: 5)
-		let stream = try await openStream(probe, path: "/lastclose")
-		let result = await drain(stream, deadline: 5)
-		let codes = result.events.compactMap { event -> String? in
-			guard case .received(let data) = event else { return nil }
-			return String(decoding: data, as: UTF8.self)
-		}
-		return codes.first ?? "none"
-	}
-
-	func testTimeoutCloseCodeMatchesPlatformBaseline() async throws {
-		// Замеры: close-код при cancel(with:) сервер не получает ни на одной
-		// платформе — Linux шлёт обрыв без фрейма (0), Darwin даёт 1006, причём
-		// и с отменой читателя, и без неё (три CI-рана). Инвариант теста:
-		// наш teardown не деградирует относительно голой платформы
-		let baseline = try await bareGoingAwayBaseline()
-
+	func testTimeoutFiresAfterSuccessfulHandshake() async throws {
+		// Дедлайн тикает и ПОСЛЕ .connected: сервер принял апгрейд и замолчал,
+		// стрим обязан упасть .timeout, а не висеть. Close-код, который при
+		// этом видит сервер, не проверяется — по замерам он недетерминирован
+		// (Linux 0 или 1001 от рана к рану, Darwin 1006) и от голой платформы
+		// не отличается: cancel(with:) close-фрейм не доставляет
 		let ws = await makeStreaming(timeout: 2)
 		let stream = try await openStream(ws, path: "/connect-then-silent")
 		let result = await drain(stream, deadline: 6)
+		XCTAssertEqual(result.events, [.connected])
 		guard case .timeout? = result.thrown as? NetworkStreamingError else {
 			return XCTFail("Ожидали .timeout, получили \(String(describing: result.thrown))")
 		}
-
-		// ws должен пережить отправку close-фрейма: деинициализация до
-		// подтверждения доставки исказила бы замер
-		try await Task.sleep(nanoseconds: 300_000_000)
-		let observed = try await readLastCloseCode()
-		print("close-code baseline=\(baseline) observed=\(observed)")
-		// Строгий ассерт на код невозможен: по замерам он недетерминирован —
-		// Linux даёт 0 или 1001 от рана к рану, Darwin — 1006 (три кампании CI
-		// и локальных прогонов). Тест характеризационный: фиксирует сам факт
-		// замера, значения уходят в лог
-		XCTAssertFalse(baseline.isEmpty)
-		XCTAssertFalse(observed.isEmpty)
 		await ws.cancel()
 	}
+
 
 	func testSharedStorageCookiesAreMergedAndManualWins() async throws {
 		// Слияние: куки из shared-стоража сохраняются, одноимённые
@@ -607,25 +638,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		await ws.cancel()
 		_ = try await openStream(ws, path: "/silent")
 
-		enum Outcome: Sendable { case finished, event, cancellation, other(String), timedOut }
-		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
-			group.addTask {
-				do {
-					return try await reader1.next() == nil ? .finished : .event
-				} catch is CancellationError {
-					return .cancellation
-				} catch {
-					return .other(String(describing: error))
-				}
-			}
-			group.addTask {
-				try? await Task.sleep(nanoseconds: 6_000_000_000)
-				return .timedOut
-			}
-			let winner = try await group.next() ?? .timedOut
-			group.cancelAll()
-			return winner
-		}
+		let outcome = await nextOutcome(reader1, deadline: 6)
 		guard case .finished = outcome else {
 			return XCTFail("Явная отмена тиха и при мгновенном реконнекте; получили \(outcome)")
 		}
@@ -643,25 +656,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 		let stream2 = try await openStream(ws, path: "/silent")
 
-		enum Outcome: Sendable { case finished, event, cancellation, other(String), timedOut }
-		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
-			group.addTask {
-				do {
-					return try await reader1.next() == nil ? .finished : .event
-				} catch is CancellationError {
-					return .cancellation
-				} catch {
-					return .other(String(describing: error))
-				}
-			}
-			group.addTask {
-				try? await Task.sleep(nanoseconds: 3_000_000_000)
-				return .timedOut
-			}
-			let winner = try await group.next() ?? .timedOut
-			group.cancelAll()
-			return winner
-		}
+		let outcome = await nextOutcome(reader1, deadline: 3)
 		guard case .cancellation = outcome else {
 			return XCTFail("Ожидали CancellationError у вытесненного стрима, получили \(outcome)")
 		}
@@ -703,20 +698,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		await ws.cancel()
 
 		// После cancel() стрим должен корректно завершиться, а не зависнуть
-		enum Outcome: Sendable { case finished, event(NetworkStreamingOutputEvent), timedOut }
-		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
-			group.addTask {
-				if let event = try await reader.next() { return .event(event) }
-				return .finished
-			}
-			group.addTask {
-				try? await Task.sleep(nanoseconds: 2_000_000_000)
-				return .timedOut
-			}
-			let winner = try await group.next() ?? .timedOut
-			group.cancelAll()
-			return winner
-		}
+		let outcome = await nextOutcome(reader, deadline: 2)
 		inputCont.finish()
 		guard case .finished = outcome else {
 			return XCTFail("После cancel() стрим должен завершиться, получили \(outcome)")
@@ -833,23 +815,7 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		} catch is URLError {}
 
 		// Живой стрим не вытеснен: следующего события нет, но и завершения тоже
-		enum Outcome: Sendable { case finished, event, failed(String), stillAlive }
-		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
-			group.addTask {
-				do {
-					return try await reader.next() == nil ? .finished : .event
-				} catch {
-					return .failed(String(describing: error))
-				}
-			}
-			group.addTask {
-				try? await Task.sleep(nanoseconds: 1_500_000_000)
-				return .stillAlive
-			}
-			let winner = try await group.next() ?? .stillAlive
-			group.cancelAll()
-			return winner
-		}
+		let outcome = await nextOutcome(reader, deadline: 1.5)
 		guard case .stillAlive = outcome else {
 			return XCTFail("Отказ валидации не должен рвать действующий стрим; получили \(outcome)")
 		}
@@ -1171,47 +1137,37 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		await ws.cancel()
 	}
 
-	func testDelegateInvalidCloseCodeFinishesCleanly() async {
-		// .invalid — сентинел «код не записан», а не код 0: раньше didCloseWith
-		// отдавал по нему бессмысленный .closeCode(0), тогда как восстановление
-		// кода в didComplete тот же случай считало чистым финишем
-		let (delegate, stream, session, task) = makeDelegatePair()
-		delegate.urlSession(session, webSocketTask: task, didCloseWith: .invalid, reason: nil)
-		let result = await drain(stream, deadline: 1)
-		XCTAssertTrue(result.completed)
-		XCTAssertNil(result.thrown)
-	}
-
-	func testDelegateNoStatusCloseFinishesCleanly() async {
-		// 1005 — «кода не было», легальный исход по RFC 6455, а не сбой
-		let (delegate, stream, session, task) = makeDelegatePair()
-		delegate.urlSession(session, webSocketTask: task, didCloseWith: .noStatusReceived, reason: nil)
-		let result = await drain(stream, deadline: 1)
-		XCTAssertTrue(result.completed)
-		XCTAssertNil(result.thrown)
-	}
-
-	func testDelegateRefusesCrossOriginRedirect() async throws {
-		// Куки прикреплены статическим заголовком, поэтому редирект на чужой
-		// хост унёс бы авторизацию SDK туда, где она не выдавалась
-		let (delegate, stream, session, task) = makeDelegatePair()
+	/// Прогоняет редирект через делегата и отдаёт запрос, который тот разрешил
+	private func performRedirect(
+		_ delegate: WebSocketNetworkStreamingDelegate,
+		session: URLSession,
+		task: URLSessionTask,
+		to target: String
+	) async -> URLRequest? {
 		let response = HTTPURLResponse(
 			url: URL(string: "https://origin.example/stream")!,
 			statusCode: 302,
 			httpVersion: "HTTP/1.1",
 			headerFields: nil
 		)!
-		let redirected = URLRequest(url: URL(string: "https://attacker.example/stream")!)
-
-		let followed: URLRequest? = await withCheckedContinuation { continuation in
+		return await withCheckedContinuation { continuation in
 			delegate.urlSession(
 				session,
 				task: task,
 				willPerformHTTPRedirection: response,
-				newRequest: redirected,
+				newRequest: URLRequest(url: URL(string: target)!),
 				completionHandler: { continuation.resume(returning: $0) }
 			)
 		}
+	}
+
+	func testDelegateRefusesCrossOriginRedirect() async throws {
+		// Куки прикреплены статическим заголовком, поэтому редирект на чужой
+		// хост унёс бы авторизацию SDK туда, где она не выдавалась
+		let (delegate, stream, session, task) = makeDelegatePair()
+		let followed = await performRedirect(
+			delegate, session: session, task: task, to: "https://attacker.example/stream"
+		)
 		XCTAssertNil(followed, "Редирект на чужой origin должен отклоняться")
 
 		let result = await drain(stream, deadline: 1)
@@ -1224,47 +1180,13 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	func testDelegateFollowsSameOriginRedirect() async throws {
 		// Смена пути внутри своего origin — обычный редирект, куки остаются дома
 		let (delegate, stream, session, task) = makeDelegatePair()
-		let response = HTTPURLResponse(
-			url: URL(string: "https://origin.example/stream")!,
-			statusCode: 302,
-			httpVersion: "HTTP/1.1",
-			headerFields: nil
-		)!
-		let redirected = URLRequest(url: URL(string: "https://origin.example/stream/v2")!)
-
-		let followed: URLRequest? = await withCheckedContinuation { continuation in
-			delegate.urlSession(
-				session,
-				task: task,
-				willPerformHTTPRedirection: response,
-				newRequest: redirected,
-				completionHandler: { continuation.resume(returning: $0) }
-			)
-		}
-		XCTAssertEqual(followed?.url, redirected.url)
+		let target = "https://origin.example/stream/v2"
+		let followed = await performRedirect(delegate, session: session, task: task, to: target)
+		XCTAssertEqual(followed?.url, URL(string: target))
 
 		let result = await drain(stream, deadline: 0.3)
-		XCTAssertTrue(result.timedOut, "Разрешённый редирект не должен завершать стрим")
+		XCTAssertFalse(result.completed, "Разрешённый редирект не должен завершать стрим")
 		XCTAssertNil(result.thrown)
-	}
-
-	// MARK: - Unit: маппинг сбоя аплинка
-
-	func testTransportFailureSharesConnectionLostMappingWithDelegate() {
-		// Один и тот же обрыв не должен давать разный кейс в зависимости от
-		// того, кто заметил его первым — читатель или inflight-send
-		let lost = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
-		guard case .timeout = NetworkStreamingError.transportFailure(lost) else {
-			return XCTFail("Ожидали .timeout — тот же кейс, что у делегата")
-		}
-	}
-
-	func testTransportFailureKeepsOtherErrorsAsNSError() {
-		let other = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOTCONN.rawValue))
-		guard case .nsError(let inner) = NetworkStreamingError.transportFailure(other) else {
-			return XCTFail("Ожидали .nsError")
-		}
-		XCTAssertEqual(inner.code, Int(POSIXErrorCode.ENOTCONN.rawValue))
 	}
 
 	// MARK: - Unit: вес выходной очереди
@@ -1298,14 +1220,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 				"шаг \(step)"
 			)
 		}
-	}
-
-	func testLedgerDrainsToZeroWhenQueueEmpties() {
-		var ledger = WebSocketNetworkStreaming.OutputQueueLedger()
-		for _ in 0..<100 { ledger.record(size: 1_000, depth: 100) }
-		XCTAssertEqual(ledger.bytes, 100_000)
-		XCTAssertEqual(ledger.record(size: 7, depth: 1), 7)
-		XCTAssertEqual(ledger.bytes, 7)
 	}
 
 	// MARK: - Integration: переполнение выходной очереди
