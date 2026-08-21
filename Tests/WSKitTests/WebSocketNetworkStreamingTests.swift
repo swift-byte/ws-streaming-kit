@@ -210,6 +210,27 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertFalse(result.completed, "Открытие не должно завершать стрим")
 	}
 
+	func testOnlyPeerSentCloseCodesOutrankTheCompletionError() {
+		// 1006 и 1015 по RFC 6455 §7.4.1 в close-фрейме запрещены: их ставит
+		// локальная сторона, когда фрейма не было. Приняв их за слово сервера,
+		// делегат подменил бы унаследованный .timeout на .closeCode при
+		// обычном обрыве связи
+		for local: URLSessionWebSocketTask.CloseCode in [.invalid, .abnormalClosure, .tlsHandshakeFailure] {
+			XCTAssertFalse(
+				WebSocketNetworkStreamingDelegate.isPeerCloseCode(local),
+				"closeCode \(local) выставляет локальная сторона"
+			)
+		}
+		for peer: URLSessionWebSocketTask.CloseCode in [
+			.normalClosure, .noStatusReceived, .goingAway, .internalServerError, .policyViolation
+		] {
+			XCTAssertTrue(
+				WebSocketNetworkStreamingDelegate.isPeerCloseCode(peer),
+				"closeCode \(peer) сервер прислать может"
+			)
+		}
+	}
+
 	func testDelegateCleanCloseCodesFinishWithoutError() async {
 		// Сбоем не считаются 1000; 1005 — «кода не было», легальный исход по
 		// RFC 6455 §7.1.5; .invalid — сентинел «код не записан»

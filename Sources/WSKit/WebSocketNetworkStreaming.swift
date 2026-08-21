@@ -65,6 +65,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// часть протокола, менять только вместе с сервером
 	private static let inputTerminator = Data([0x31])
 	private static let reservedCookieNames = Set(Cookies.allCases.map { $0.rawValue.lowercased() })
+	/// Общий порядок обхода зарезервированных кук: сбор и слияние должны
+	/// ходить по одному списку, а не строить его каждый своим способом
+	private static let reservedCookieOrder = Cookies.allCases.map(\.rawValue)
 
 	/// Граница ожидания дренажа: по истечении стрим финиширует, не дожидаясь
 	/// читателя. В happy path снимается сразу, как только читатель завершился
@@ -244,6 +247,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 
 		var request = URLRequest(url: url)
+		// У самого запроса дефолт 60с, и он перекрывает конфигурацию сессии —
+		// без этой строки платформа опережала бы наш дедлайн при timeout > 30
+		request.timeoutInterval = Self.platformRequestTimeout(for: timeout)
 		// Порядок обхода словаря не определён, а имена заголовков
 		// регистронезависимы: без сортировки и учёта уже занятых имён пара
 		// ["X-Trace": a, "x-trace": b] уходила бы на провод по-разному от
@@ -278,11 +284,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// путать замену со штатным закрытием), явная отмена — тихий finish,
 			// единый с контрактом поднятого стрима
 			outputContinuation.onTermination = nil
-			if lifecycleToken.superseded {
-				outputContinuation.finish(throwing: CancellationError())
-			} else {
-				outputContinuation.finish()
-			}
+			outputContinuation.finish(throwing: outcome(for: lifecycleToken, terminalError: nil))
 			return outputStream
 		}
 
@@ -468,8 +470,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) -> Bool {
 		guard requested == generation else { return false }
-		outputContinuation.yield(.connected)
-		return true
+		// .terminated значит, что потребитель бросил стрим, а хоп его
+		// onTermination ещё не долетел до актора. Продолжать нельзя: иначе
+		// поднимутся читатель и аплинк ради стрима, который никто не читает,
+		// и в сокет полетит ввод вызывающего
+		guard case .terminated = outputContinuation.yield(.connected) else { return true }
+		return false
 	}
 
 	/// Исход стрима — одним изолированным шагом: флаг токена живёт в изоляции
@@ -660,9 +666,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// не имеет), то есть срабатывает чуть раньше, а не позже
 					switch outputContinuation.yield(.received(payload)) {
 					case .enqueued(let remaining):
+						// remaining клампится до вычитания: у неограниченной
+						// политики он Int.max, и разность переполнилась бы
+						// раньше, чем её увидел бы ledger
 						let queuedBytes = ledger.record(
 							size: payload.count,
-							depth: Self.outputBufferDepth - remaining
+							depth: Self.outputBufferDepth - min(remaining, Self.outputBufferDepth)
 						)
 						guard queuedBytes > Self.outputBufferBytes else { continue }
 					case .dropped:
@@ -838,7 +847,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// обесценит уже собранный запрос. Обход идёт по allCases, а не по
 		// результату, чтобы порядок не зависел от того, кто финишировал первым
 		let fetched = await fetchReservedCookies()
-		for name in Cookies.allCases.map(\.rawValue) {
+		for name in Self.reservedCookieOrder {
 			guard let value = fetched[name] else {
 				// Рукопожатие уйдёт без авторизации, и сервер закроет его сам —
 				// без этого лога причина отказа неотличима от серверной
@@ -869,7 +878,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// сервер его отклонит, и это определённый исход, а не вечное ожидание
 	private func fetchReservedCookies() async -> [String: String] {
 		let storage = cookieStorage
-		let names = Cookies.allCases.map(\.rawValue)
+		let names = Self.reservedCookieOrder
+		guard names.isEmpty == false else { return [:] }
 		// Каждое чтение публикуется своим сообщением, а не общим результатом:
 		// иначе одна зависшая кука уносила бы по дедлайну и те, что уже
 		// прочитались, и рукопожатие уходило бы вовсе без авторизации
@@ -1095,11 +1105,26 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		continuation.finish()
 	}
 
-	/// Сбоем не считаются: 1000, 1005 («кода не было» — легальный исход по
-	/// RFC 6455 §7.1.5) и .invalid — сентинел «код не записан», по которому
-	/// сказать о сбое нечего
+	/// Сбоем не считаются: 1000, 1005 («кода не было» — по RFC 6455 §7.1.5
+	/// закрытие состоялось, просто без причины; это осознанное отличие от
+	/// исходной версии, где 1005 приезжал ошибкой) и .invalid — сентинел
+	/// «код не записан», по которому сказать о сбое нечего
 	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
 		closeCode == .normalClosure || closeCode == .noStatusReceived || closeCode == .invalid
+	}
+
+	/// Код, который мог прийти в close-фрейме от сервера. 1006 и 1015 по
+	/// RFC 6455 §7.4.1 в фрейме запрещены — их выставляет локальная сторона,
+	/// когда фрейма не было вовсе, поэтому словом сервера они не являются и
+	/// не должны перебивать ошибку завершения (для -1005 это означало бы
+	/// подмену унаследованного `.timeout` на `.closeCode`)
+	static func isPeerCloseCode(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
+		switch closeCode {
+		case .invalid, .abnormalClosure, .tlsHandshakeFailure:
+			return false
+		default:
+			return true
+		}
 	}
 }
 
@@ -1137,12 +1162,13 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		task: URLSessionTask,
 		didCompleteWithError error: Error?
 	) {
-		// Состоявшееся close-рукопожатие важнее ошибки завершения: код известен,
-		// а ошибка после него — шум нашего же teardown'а. .invalid значит, что
-		// рукопожатия не было и решает ошибка. Это же спасает код, когда
-		// didCloseWith не доехал (замерено: теряется безотносительно кода)
+		// Состоявшееся close-рукопожатие важнее ошибки завершения: код сказал
+		// сервер, а ошибка после него — шум нашего же teardown'а. Это же спасает
+		// код, когда didCloseWith не доехал (замерено: теряется безотносительно
+		// кода). Локальные сентинелы (см. isPeerCloseCode) сервер прислать не
+		// мог — там исход называет ошибка
 		if let webSocketTask = task as? URLSessionWebSocketTask,
-		   webSocketTask.closeCode != .invalid {
+		   Self.isPeerCloseCode(webSocketTask.closeCode) {
 			finish(closeCode: webSocketTask.closeCode)
 			return
 		}
