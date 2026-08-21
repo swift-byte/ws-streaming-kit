@@ -20,7 +20,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	// MARK: - Private Properties
 
 	private static let inputTerminator = Data([0x31])
-	private static let reservedCookieNames = Set(Cookies.allCases.map(\.rawValue))
+	private static let reservedCookieNames = Set(Cookies.allCases.map { $0.rawValue.lowercased() })
 
 	/// Граница ожидания дренажа: по истечении стрим финиширует, не дожидаясь
 	/// читателя. В happy path снимается сразу, как только читатель завершился
@@ -55,6 +55,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	private let kidsURLSession: KidsURLSession
 	private let cookieStorage: CookieStorage
 	private let timeout: Int
+	private let allowsInsecureEndpoint: Bool
 	private let session: URLSession
 	private let handshakeCookieStorage: HTTPCookieStorage?
 
@@ -71,13 +72,19 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	/// - Parameter timeout: секунды ожидания ПЕРВОГО входящего сообщения
 	///   (не только рукопожатия); значения вне 1...3600 клампятся к границам.
+	/// - Parameter allowsInsecureEndpoint: разрешает ws:// вне loopback.
+	///   Включать только там, где TLS терминируется вне приложения (on-prem,
+	///   стенд в приватной сети): SDK-куки пойдут открытым текстом. Решение
+	///   принадлежит конфигурации — рантайм лишь исполняет его.
 	init(
 		kidsURLSession: KidsURLSession,
 		cookieStorage: CookieStorage,
-		timeout: Int? = nil
+		timeout: Int? = nil,
+		allowsInsecureEndpoint: Bool = false
 	) {
 		self.kidsURLSession = kidsURLSession
 		self.cookieStorage = cookieStorage
+		self.allowsInsecureEndpoint = allowsInsecureEndpoint
 		// Нижняя граница спасает UInt64-конверсию от отрицательного значения
 		// (иначе трап); верхняя — санитарный предел
 		self.timeout = min(max(1, timeout ?? 15), 3_600)
@@ -141,7 +148,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		headers: [String: String],
 		inputStream: AsyncStream<Data>
 	) async throws -> AsyncThrowingStream<AssistantSDK.NetworkStreamingOutputEvent, any Error> {
-		let url = try Self.validate(endpoint: endpoint)
+		let url = try Self.validate(endpoint: endpoint, allowsInsecure: allowsInsecureEndpoint)
 
 		// Вытеснение: помечается токен текущего владельца — живого стрима или
 		// вызова в окне кук. Глобальной бухгалтерии нет: токен умирает вместе
@@ -164,7 +171,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		var request = URLRequest(url: url)
 		for (key, value) in headers {
-			guard Self.isValidHeaderName(key), Self.isValidHeaderValue(value) else {
+			guard Self.isToken(key), Self.isValidHeaderValue(value) else {
 				// Такую пару Foundation отбрасывает целиком и молча — без лога
 				// заголовка просто не окажется на проводе, и это никак не видно.
 				// Имя в лог идёт очищенным: CR/LF в нём подделали бы запись лога
@@ -276,9 +283,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// - `.unsupportedURL` — схема не ws/wss. Вебсокет-задача определена только
 	///   на них (замерено: с http:// рукопожатие просто не отвечает), а поздний
 	///   отказ пришёл бы уже после teardown действующего стрима.
-	/// - `.appTransportSecurityRequiresSecureConnection` — ws вне loopback:
-	///   SDK-куки ушли бы открытым текстом и достались бы любому на пути.
-	static func validate(endpoint: String) throws -> URL {
+	/// - `.appTransportSecurityRequiresSecureConnection` — ws вне loopback без
+	///   явного разрешения: SDK-куки ушли бы открытым текстом и достались бы
+	///   любому на пути.
+	static func validate(endpoint: String, allowsInsecure: Bool = false) throws -> URL {
 		guard let url = URL(string: endpoint),
 			  let scheme = url.scheme?.lowercased(),
 			  let host = url.host,
@@ -289,7 +297,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		case "wss":
 			return url
 		case "ws":
-			guard isLoopback(host: host) else {
+			guard allowsInsecure || isLoopback(host: host) else {
 				Logger.assistant.error(S("Insecure endpoint rejected: \(scheme)"))
 				throw URLError(.appTransportSecurityRequiresSecureConnection)
 			}
@@ -435,7 +443,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// гонка didClose/didComplete не подменит семантику, потребитель
 					// получит транспортную ошибку, а не «сервер договорил»
 					delegateContinuation.finish(
-						throwing: NetworkStreamingError.uplinkFailure(error as NSError)
+						throwing: NetworkStreamingError.transportFailure(error as NSError)
 					)
 					task.cancel(with: .goingAway, reason: nil)
 				}
@@ -469,7 +477,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			defer { doneContinuation.finish() }
 			var isFirstMessage = true
 			var warnedTextFrame = false
+			// Вес очереди: FIFO размеров с головным индексом. removeFirst на
+			// каждый кадр давал бы O(n)-сдвиг ровно в том режиме, ради которого
+			// граница и заведена, — когда потребитель уже не успевает
 			var queuedSizes: [Int] = []
+			var queuedHead = 0
 			var queuedBytes = 0
 			do {
 				while Task.isCancelled == false {
@@ -514,8 +526,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						queuedSizes.append(payload.count)
 						queuedBytes += payload.count
 						let depth = Self.outputBufferDepth - remaining
-						while queuedSizes.count > depth {
-							queuedBytes -= queuedSizes.removeFirst()
+						while queuedSizes.count - queuedHead > depth {
+							queuedBytes -= queuedSizes[queuedHead]
+							queuedHead += 1
+						}
+						if queuedHead > Self.outputBufferDepth {
+							queuedSizes.removeFirst(queuedHead)
+							queuedHead = 0
 						}
 						guard queuedBytes > Self.outputBufferBytes else { continue }
 					case .dropped:
@@ -668,7 +685,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Одноимённые упорядочены по возрастанию специфичности, побеждает
 		// последняя. Порядок тотальный — sort в Swift нестабилен
 		let storedCookies = (handshakeCookieStorage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
-			.filter { Self.reservedCookieNames.contains($0.name) == false }
+			.filter { Self.reservedCookieNames.contains($0.name.lowercased()) == false }
 			.filter { Self.isSerializableCookie(name: $0.name, value: $0.value) }
 			.sorted { Self.specificity(of: $0) < Self.specificity(of: $1) }
 		for cookie in storedCookies {
@@ -729,31 +746,27 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		])
 	}
 
-	/// Гарантия ровно одна: пара не разорвёт заголовок, который мы собираем, —
-	/// отсечены CTL (C0 и DEL) и разделители Cookie. Это НЕ проверка на
-	/// соответствие cookie-octet из RFC 6265: пробел, кавычка, обратный слеш и
+	/// Имя — RFC 7230 token (RFC 6265 4.1.1 ссылается на него же). Строгость
+	/// тут не косметическая: имя вида " sessionid" прошло бы фильтр
+	/// зарезервированных (сравнение точное), а сервер, срезающий пробелы,
+	/// прочитал бы его как sessionid и получил вторую пару с тем же именем.
+	///
+	/// Про значение гарантия ровно одна: оно не разорвёт заголовок, который мы
+	/// собираем, — отсечены CTL (C0, C1 и DEL) и разделители Cookie. Это НЕ
+	/// проверка на cookie-octet из RFC 6265: пробел, кавычка, обратный слеш и
 	/// не-ASCII проходят, и строгий сервер вправе такую пару отбросить.
-	/// Ужесточать до allowlist нельзя вслепую — это отрезало бы легальные
-	/// форматы токенов; Cf (U+FEFF, U+200B, мягкий перенос) разрешены
-	/// намеренно, заголовок ими не разорвать
+	/// Ужесточать до allowlist нельзя вслепую — отрезало бы легальные форматы
+	/// токенов. Cf (U+FEFF, U+200B, мягкий перенос) разрешены намеренно:
+	/// заголовок ими не разорвать. '=' в значении легален и обязателен для
+	/// base64 с паддингом — сервер режет пару по ПЕРВОМУ '='
 	private static func isSerializableCookie(name: String, value: String) -> Bool {
-		name.isEmpty == false && isValidCookieName(name) && isValidCookieValue(value)
-	}
-
-	/// '=' в имени разорвало бы пару, поэтому запрещён именно здесь
-	private static func isValidCookieName(_ name: String) -> Bool {
-		isCookieOctets(name) && name.contains("=") == false
-	}
-
-	/// '=' внутри значения легален (RFC 6265 4.1.1) и обязателен для base64 с
-	/// паддингом: сервер режет пару по ПЕРВОМУ '=', так что подменить ничего нельзя
-	private static func isValidCookieValue(_ value: String) -> Bool {
-		isCookieOctets(value)
+		isToken(name) && isCookieOctets(value)
 	}
 
 	private static func isCookieOctets(_ text: String) -> Bool {
 		text.unicodeScalars.allSatisfy { scalar in
 			scalar.value >= 0x20 && scalar.value != 0x7F
+				&& (scalar.value < 0x80 || scalar.value > 0x9F)
 				&& scalar != ";" && scalar != ","
 		}
 	}
@@ -766,7 +779,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// потеря была бы молчаливой (на Linux такая пара доехала бы и сломала
 	/// рукопожатие: там Foundation её сохраняет)
 	private static let reservedHeaderNames: Set<String> = [
-		"connection", "upgrade", "host", "content-length", "transfer-encoding"
+		"connection", "upgrade", "host", "content-length", "transfer-encoding",
+		// Cookie принадлежит addCookies: он всё равно перезапишет заголовок,
+		// и без этой строки потеря была бы молчаливой
+		"cookie"
 	]
 
 	private static func isReservedHeaderName(_ name: String) -> Bool {
@@ -774,16 +790,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return reservedHeaderNames.contains(lowered) || lowered.hasPrefix("sec-websocket-")
 	}
 
-	/// RFC 7230 token: имя с управляющими символами Foundation принимает
-	/// дословно, поэтому отбраковываем его сами. Пробел и таб уже отсечены
-	/// проверкой `> 0x20`, в наборе их нет
-	private static let headerNameSeparators = Set("()<>@,;:\\\"/[]?={}")
+	/// RFC 7230 token — общий словарь для имён заголовков и кук. Имя с
+	/// управляющими символами Foundation принимает дословно, поэтому
+	/// отбраковываем сами. Пробел и таб уже отсечены проверкой `> 0x20`,
+	/// в наборе разделителей их нет
+	private static let tokenSeparators = Set("()<>@,;:\\\"/[]?={}")
 
-	private static func isValidHeaderName(_ name: String) -> Bool {
-		guard name.isEmpty == false else { return false }
-		return name.unicodeScalars.allSatisfy { scalar in
+	private static func isToken(_ text: String) -> Bool {
+		guard text.isEmpty == false else { return false }
+		return text.unicodeScalars.allSatisfy { scalar in
 			scalar.isASCII && scalar.value > 0x20 && scalar.value != 0x7F
-				&& headerNameSeparators.contains(Character(scalar)) == false
+				&& tokenSeparators.contains(Character(scalar)) == false
 		}
 	}
 
@@ -795,11 +812,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
-	/// Управляющие символы схлопываются в '?': строчный лог-сток иначе принял бы
-	/// перевод строки из чужого имени за начало новой записи
+	/// Всё, что лог-сток может принять за конец строки, схлопывается в '?':
+	/// иначе чужое имя подделало бы вторую запись в логе. Кроме C0 и DEL это
+	/// NEL и разделители строк/абзацев Unicode — их режут splitlines(),
+	/// enumerateLines и типовые JS-сплиттеры
+	private static let logLineBreakers: Set<UInt32> = [0x85, 0x2028, 0x2029]
+
 	private static func logSafe(_ text: String) -> String {
 		let scrubbed = String(String.UnicodeScalarView(text.unicodeScalars.map { scalar in
-			scalar.value < 0x20 || scalar.value == 0x7F ? "?" : scalar
+			scalar.value < 0x20 || scalar.value == 0x7F || logLineBreakers.contains(scalar.value)
+				? "?"
+				: scalar
 		}))
 		return scrubbed.count > 64 ? String(scrubbed.prefix(64)) + "…" : scrubbed
 	}
@@ -809,12 +832,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 extension NetworkStreamingError {
 
-	/// Маппинг сбоя аплинка. Кейс потери соединения общий с делегатом: иначе
-	/// один и тот же обрыв давал бы .timeout или .nsError в зависимости от того,
-	/// кто заметил его первым — читатель или inflight-send. Ветка делегата
-	/// «POSIX 57 → чистый финиш» сюда не переносится: сбой отправки не должен
-	/// выглядеть как «сервер договорил»
-	static func uplinkFailure(_ error: NSError) -> NetworkStreamingError {
+	/// Единственный маппинг транспортной ошибки в кейс контракта. Общий для
+	/// обоих наблюдателей — делегата и inflight-send: иначе один и тот же обрыв
+	/// давал бы .timeout или .nsError в зависимости от того, кто заметил его
+	/// первым. Ветки делегата, завершающие стрим ЧИСТО (наша же отмена,
+	/// POSIX 57), сюда не переносятся: сбой отправки не должен выглядеть как
+	/// «сервер договорил»
+	static func transportFailure(_ error: NSError) -> NetworkStreamingError {
 		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
 			return .timeout
 		}
@@ -921,13 +945,9 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			continuation.finish()
 			return
 		}
-		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
-			// Унаследованный контракт SDK: потребители различают исходы по этим
-			// кейсам, менять только синхронно с вызывающим кодом
-			continuation.finish(throwing: NetworkStreamingError.timeout)
-			return
-		}
-		continuation.finish(throwing: NetworkStreamingError.nsError(error))
+		// Унаследованный контракт SDK: потребители различают исходы по этим
+		// кейсам, менять только синхронно с вызывающим кодом
+		continuation.finish(throwing: NetworkStreamingError.transportFailure(error))
 	}
 
 	private func isSameOrigin(_ target: URL) -> Bool {

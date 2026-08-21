@@ -1049,6 +1049,89 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		await ws.cancel()
 	}
 
+	func testCookieNameWithWhitespaceIsDropped() async throws {
+		// " sessionid" не равен "sessionid", поэтому фильтр зарезервированных
+		// его пропускает, а сервер, срезающий пробелы, получил бы вторую пару
+		// с тем же именем — подмену авторизации в обход фильтра
+		for name in [" sessionid", "sessionid ", "session\tid"] {
+			let padded = HTTPCookie(properties: [
+				.name: name, .value: "ATTACKER", .domain: "127.0.0.1", .path: "/"
+			])
+			guard let padded else { continue }
+			HTTPCookieStorage.shared.setCookie(padded)
+			let ws = await makeStreaming(cookies: [.session: "REAL"])
+			let header = await cookieHeader(ws, for: wsBase + "/cookie")
+			XCTAssertFalse(header.contains("ATTACKER"), "Имя \(name.debugDescription): \(header)")
+			XCTAssertTrue(header.contains("sessionid=REAL"), "Имя \(name.debugDescription): \(header)")
+			HTTPCookieStorage.shared.deleteCookie(padded)
+		}
+	}
+
+	func testCallerCookieHeaderIsReportedAsOwned() async throws {
+		// Cookie принадлежит пайплайну: addCookies его перезапишет в любом
+		// случае, поэтому пара вызывающего отбраковывается на входе, а не
+		// пропадает молча
+		let ws = await makeStreaming(timeout: 10)
+		let stream = try await openStream(ws, path: "/cookie", headers: ["Cookie": "experiment=b"])
+		var iterator = stream.makeAsyncIterator()
+		_ = try await iterator.next() // .connected
+		guard case .received(let data)? = try await iterator.next() else {
+			return XCTFail("Ожидали данные с Cookie-заголовком")
+		}
+		let header = String(decoding: data, as: UTF8.self)
+		XCTAssertFalse(header.contains("experiment=b"), "Cookie вызывающего не должен доезжать: \(header)")
+		await ws.cancel()
+	}
+
+	func testCookieValueWithC1ControlIsRejected() async throws {
+		// C1 (0x80–0x9F) — тоже управляющие: парсер, читающий заголовок как
+		// ISO-8859-1, видит голый 0x85 и может принять его за конец строки
+		let ws = await makeStreaming()
+		let url = URL(string: "wss://example.com/path")!
+		for value in ["a\u{0085}b", "a\u{009F}b"] {
+			let cookie = await ws.createCookie(name: "sessionid", value: value, for: url)
+			XCTAssertNil(cookie, "Значение \(value.debugDescription) должно отбраковываться")
+		}
+	}
+
+	func testInsecureEndpointIsAllowedWhenExplicitlyOptedIn() throws {
+		// Решение о плейнтексте принадлежит конфигурации: стенд, где TLS
+		// терминируется снаружи, должен иметь явную дверь, а не отсутствие двери
+		XCTAssertThrowsError(try WebSocketNetworkStreaming.validate(endpoint: "ws://backend.internal/stream"))
+		XCTAssertNoThrow(
+			try WebSocketNetworkStreaming.validate(endpoint: "ws://backend.internal/stream", allowsInsecure: true)
+		)
+	}
+
+	func testRedirectGuardIsReachedThroughProtocolDispatch() async throws {
+		// Тест на диспетчеризацию, а не на логику: делегат ставится в
+		// task.delegate и вызывается платформой через URLSessionTaskDelegate.
+		// Если сигнатура перестанет удовлетворять требованию протокола,
+		// сработает дефолтная реализация — редирект пойдёт, а гард промолчит
+		let (delegate, stream, session, task) = makeDelegatePair()
+		let dispatched: URLSessionTaskDelegate = delegate
+		let response = HTTPURLResponse(
+			url: URL(string: "https://origin.example/stream")!,
+			statusCode: 302,
+			httpVersion: "HTTP/1.1",
+			headerFields: nil
+		)!
+		let redirected = URLRequest(url: URL(string: "https://attacker.example/stream")!)
+
+		let followed: URLRequest? = await withCheckedContinuation { continuation in
+			dispatched.urlSession(
+				session,
+				task: task,
+				willPerformHTTPRedirection: response,
+				newRequest: redirected,
+				completionHandler: { continuation.resume(returning: $0) }
+			)
+		}
+		XCTAssertNil(followed, "Гард должен вызываться через протокол, а не только напрямую")
+		let result = await drain(stream, deadline: 1)
+		XCTAssertNotNil(result.thrown)
+	}
+
 	func testDelegateNoStatusCloseFinishesCleanly() async {
 		// 1005 — «кода не было», легальный исход по RFC 6455, а не сбой
 		let (delegate, stream, session, task) = makeDelegatePair()
@@ -1117,18 +1200,18 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 
 	// MARK: - Unit: маппинг сбоя аплинка
 
-	func testUplinkFailureSharesConnectionLostMappingWithDelegate() {
+	func testTransportFailureSharesConnectionLostMappingWithDelegate() {
 		// Один и тот же обрыв не должен давать разный кейс в зависимости от
 		// того, кто заметил его первым — читатель или inflight-send
 		let lost = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
-		guard case .timeout = NetworkStreamingError.uplinkFailure(lost) else {
+		guard case .timeout = NetworkStreamingError.transportFailure(lost) else {
 			return XCTFail("Ожидали .timeout — тот же кейс, что у делегата")
 		}
 	}
 
-	func testUplinkFailureKeepsOtherErrorsAsNSError() {
+	func testTransportFailureKeepsOtherErrorsAsNSError() {
 		let other = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOTCONN.rawValue))
-		guard case .nsError(let inner) = NetworkStreamingError.uplinkFailure(other) else {
+		guard case .nsError(let inner) = NetworkStreamingError.transportFailure(other) else {
 			return XCTFail("Ожидали .nsError")
 		}
 		XCTAssertEqual(inner.code, Int(POSIXErrorCode.ENOTCONN.rawValue))
