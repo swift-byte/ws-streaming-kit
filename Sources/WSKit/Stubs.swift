@@ -74,6 +74,26 @@ extension KidsURLSession: URLSessionWebSocketDelegate, URLSessionTaskDelegate {
 		task.delegate?
 			.urlSession(session, task: task, didCompleteWithError: error)
 	}
+
+	func urlSession(
+		_ session: URLSession,
+		task: URLSessionTask,
+		willPerformHTTPRedirection response: HTTPURLResponse,
+		newRequest request: URLRequest,
+		completionHandler: @Sendable @escaping (URLRequest?) -> Void
+	) {
+		guard let delegate = task.delegate else {
+			completionHandler(request)
+			return
+		}
+		delegate.urlSession(
+			session,
+			task: task,
+			willPerformHTTPRedirection: response,
+			newRequest: request,
+			completionHandler: completionHandler
+		)
+	}
 }
 #endif
 

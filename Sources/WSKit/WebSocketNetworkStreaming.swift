@@ -37,10 +37,16 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// а не безграничный рост (худший случай — outputBufferDepth × maximumMessageSize)
 	private static let outputBufferDepth = 1024
 
-	/// Дедлайны на живом соединении принадлежат нашему таймеру и вызывающему,
-	/// а не CFNetwork: дефолтные 60с timeoutIntervalForRequest рвали молчащий,
-	/// но здоровый сокет и обесценивали invalidate()
-	private static let platformRequestTimeout: TimeInterval = 24 * 60 * 60
+	/// Платформенный дедлайн простоя — последняя страховка от соединения,
+	/// умершего без FIN: сокет, молчащий дольше, CFNetwork закроет сам.
+	/// Дефолтные 60с рвали здоровое соединение раньше нашего таймера и
+	/// обесценивали invalidate(), поэтому дедлайн выводится из timeout и
+	/// заведомо длиннее его. Приложению, которому нужны более долгие паузы,
+	/// придётся греть соединение на своём уровне: ping/pong тут не заводим —
+	/// проверить его на целевой платформе из этого окружения нечем
+	private static func platformRequestTimeout(for timeout: Int) -> TimeInterval {
+		max(TimeInterval(timeout) * 2, 300)
+	}
 
 	private let kidsURLSession: KidsURLSession
 	private let cookieStorage: CookieStorage
@@ -74,7 +80,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		let configuration = URLSessionConfiguration.default
 		configuration.httpCookieStorage = .shared
-		configuration.timeoutIntervalForRequest = Self.platformRequestTimeout
+		configuration.timeoutIntervalForRequest = Self.platformRequestTimeout(for: self.timeout)
 		handshakeCookieStorage = configuration.httpCookieStorage
 		session = URLSession(
 			configuration: configuration,
@@ -154,8 +160,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		for (key, value) in headers {
 			guard Self.isValidHeaderName(key), Self.isValidHeaderValue(value) else {
 				// Такую пару Foundation отбрасывает целиком и молча — без лога
-				// заголовка просто не окажется на проводе, и это никак не видно
-				Logger.assistant.error(S("Header rejected: \(key)"))
+				// заголовка просто не окажется на проводе, и это никак не видно.
+				// Имя в лог идёт очищенным: CR/LF в нём подделали бы запись лога
+				Logger.assistant.error(S("Header rejected: \(Self.logSafe(key))"))
 				continue
 			}
 			request.setValue(value, forHTTPHeaderField: key)
@@ -221,7 +228,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// унаследована от протокола, — поэтому вызов, разошедшийся с новым
 	/// `establishStream`, закроет уже новый стрим, и тот финиширует, не отдав
 	/// ни одного события; вызывающему стоит упорядочивать отмену и переподъём.
-	/// Уже буферизованный платформой хвост входящих может быть доставлен до финиша.
+	/// Хвост входящих при отмене НЕ гарантирован: тот же teardown отменяет
+	/// читателя, и уже принятый, но ещё не отданный кадр теряется. Дозакрытие с
+	/// доставкой хвоста гарантировано только для закрытия по инициативе сервера.
 	func cancel() async {
 		cancel(generation: generation)
 	}
@@ -243,22 +252,32 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Endpoint Validation
 
-	/// Отбраковывает endpoint до любого teardown'а.
+	/// Отбраковывает endpoint до любого teardown'а. Internal, а не private,
+	/// ради прямого теста без поднятия соединения.
 	/// - `.badURL` — строка не разобралась либо в ней нет схемы или хоста.
+	/// - `.unsupportedURL` — схему вебсокет-задача не умеет вести; иначе отказ
+	///   пришёл бы поздно, уже разрушив действующий стрим.
 	/// - `.appTransportSecurityRequiresSecureConnection` — транспорт без TLS вне
 	///   loopback: SDK-куки ушли бы открытым текстом и достались бы любому на пути.
-	private static func validate(endpoint: String) throws -> URL {
+	static func validate(endpoint: String) throws -> URL {
 		guard let url = URL(string: endpoint),
 			  let scheme = url.scheme?.lowercased(),
 			  let host = url.host,
 			  host.isEmpty == false else {
 			throw URLError(.badURL)
 		}
-		guard scheme == "wss" || scheme == "https" || isLoopback(host: host) else {
-			Logger.assistant.error(S("Insecure endpoint rejected: \(scheme)"))
-			throw URLError(.appTransportSecurityRequiresSecureConnection)
+		switch scheme {
+		case "wss", "https":
+			return url
+		case "ws", "http":
+			guard isLoopback(host: host) else {
+				Logger.assistant.error(S("Insecure endpoint rejected: \(scheme)"))
+				throw URLError(.appTransportSecurityRequiresSecureConnection)
+			}
+			return url
+		default:
+			throw URLError(.unsupportedURL)
 		}
-		return url
 	}
 
 	private static func isLoopback(host: String) -> Bool {
@@ -536,6 +555,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// терминальным событием того же teardown'а: вытеснение —
 			// CancellationError, явная отмена — тихий finish. Терминальная
 			// ошибка остаётся исходом там, где стрим умер сам
+			// Снимаем onTermination перед финишем: иначе он планирует Task с
+			// cancel() того же поколения, который следующей строкой отработает
+			// и сам — хоп гарантированно холостой. Окна тут нет, между снятием
+			// и финишем нет точки приостановки
+			outputContinuation.onTermination = nil
 			let outcome = Task.isCancelled ? await self?.outcome(for: lifecycleToken) : nil
 			if outcome?.superseded == true {
 				outputContinuation.finish(throwing: CancellationError())
@@ -577,15 +601,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// «; » без экранирования, поэтому ';' внутри чужого значения протаскивал
 		// бы в заголовок произвольные пары — включая повторный sessionid, который
 		// last-wins сервер и примет, то есть ровно в обход фильтра по имени.
-		// Одноимённые упорядочены по специфичности (домен, затем длина path):
-		// точечная кука перекрывает широкую. Порядок тотальный — sort нестабилен
+		// Одноимённые упорядочены по возрастанию специфичности, побеждает
+		// последняя. Порядок тотальный — sort в Swift нестабилен
 		let storedCookies = (handshakeCookieStorage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
 			.filter { Self.reservedCookieNames.contains($0.name) == false }
 			.filter { Self.isSerializableCookie(name: $0.name, value: $0.value) }
-			.sorted {
-				($0.domain.count, $0.path.count, $0.path, $0.domain)
-					< ($1.domain.count, $1.path.count, $1.path, $1.domain)
-			}
+			.sorted { Self.specificity(of: $0) < Self.specificity(of: $1) }
 		for cookie in storedCookies {
 			merged[cookie.name] = cookie
 		}
@@ -610,6 +631,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		for (headerField, headerValue) in cookieHeaders {
 			request.setValue(headerValue, forHTTPHeaderField: headerField)
 		}
+	}
+
+	/// Специфичность куки по RFC 6265 5.4: сперва длина path, при равной —
+	/// host-only конкретнее доменной. Длину домена как признак брать нельзя:
+	/// Foundation ставит доменной куке ведущую точку, и та ОКАЗЫВАЕТСЯ длиннее
+	/// host-only варианта того же хоста
+	private static func specificity(of cookie: HTTPCookie) -> (Int, Int, String, String) {
+		(cookie.path.count, cookie.domain.hasPrefix(".") ? 0 : 1, cookie.path, cookie.domain)
 	}
 
 	/// ws→http, wss→https: матчинг стоража и secure-куки работают по HTTP-схемам
@@ -642,26 +671,39 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// заголовок ей не разорвать, а CharacterSet.controlCharacters забраковал
 	/// бы по ней валидный токен
 	private static func isSerializableCookie(name: String, value: String) -> Bool {
-		name.isEmpty == false && isCookieOctets(name) && isCookieOctets(value)
+		name.isEmpty == false && isValidCookieName(name) && isValidCookieValue(value)
+	}
+
+	/// '=' в имени разорвало бы пару, поэтому запрещён именно здесь
+	private static func isValidCookieName(_ name: String) -> Bool {
+		isCookieOctets(name) && name.contains("=") == false
+	}
+
+	/// '=' внутри значения легален (RFC 6265 4.1.1) и обязателен для base64 с
+	/// паддингом: сервер режет пару по ПЕРВОМУ '=', так что подменить ничего нельзя
+	private static func isValidCookieValue(_ value: String) -> Bool {
+		isCookieOctets(value)
 	}
 
 	private static func isCookieOctets(_ text: String) -> Bool {
 		text.unicodeScalars.allSatisfy { scalar in
 			scalar.value >= 0x20 && scalar.value != 0x7F
-				&& scalar != ";" && scalar != "," && scalar != "="
+				&& scalar != ";" && scalar != ","
 		}
 	}
 
 	// MARK: - Header Validation
 
 	/// RFC 7230 token: имя с управляющими символами Foundation принимает
-	/// дословно, поэтому отбраковываем его сами
+	/// дословно, поэтому отбраковываем его сами. Пробел и таб уже отсечены
+	/// проверкой `> 0x20`, в наборе их нет
+	private static let headerNameSeparators = Set("()<>@,;:\\\"/[]?={}")
+
 	private static func isValidHeaderName(_ name: String) -> Bool {
-		let separators = Set("()<>@,;:\\\"/[]?={} \t")
 		guard name.isEmpty == false else { return false }
 		return name.unicodeScalars.allSatisfy { scalar in
 			scalar.isASCII && scalar.value > 0x20 && scalar.value != 0x7F
-				&& separators.contains(Character(scalar)) == false
+				&& headerNameSeparators.contains(Character(scalar)) == false
 		}
 	}
 
@@ -671,6 +713,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		value.unicodeScalars.allSatisfy { scalar in
 			scalar.value == 0x09 || (scalar.value >= 0x20 && scalar.value != 0x7F)
 		}
+	}
+
+	/// Управляющие символы схлопываются в '?': строчный лог-сток иначе принял бы
+	/// перевод строки из чужого имени за начало новой записи
+	private static func logSafe(_ text: String) -> String {
+		let scrubbed = String(String.UnicodeScalarView(text.unicodeScalars.map { scalar in
+			scalar.value < 0x20 || scalar.value == 0x7F ? "?" : scalar
+		}))
+		return scrubbed.count > 64 ? String(scrubbed.prefix(64)) + "…" : scrubbed
 	}
 }
 
@@ -747,10 +798,11 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 	) {
 		guard let target = request.url, isSameOrigin(target) else {
 			Logger.assistant.error(S("WebSocket handshake redirect refused"))
-			completionHandler(nil)
-			// Отказ сам по себе завершает задачу без ошибки, и стрим выглядел бы
-			// как штатно закрытый: причину фиксируем явно
+			// Причина фиксируется ДО возврата управления (паттерн fireTimeout):
+			// отказ завершает задачу без ошибки, и didComplete, успей он первым,
+			// выдал бы стрим за штатно закрытый — finish первый-выигрывает
 			continuation.finish(throwing: NetworkStreamingError.nsError(URLError(.unsupportedURL) as NSError))
+			completionHandler(nil)
 			return
 		}
 		completionHandler(request)

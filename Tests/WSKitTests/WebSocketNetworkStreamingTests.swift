@@ -777,16 +777,31 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		}
 	}
 
-	func testSecureAndLoopbackEndpointsPassValidation() async throws {
+	func testSecureAndLoopbackEndpointsPassValidation() throws {
 		// wss/https проходят с любым хостом, ws/http — только на loopback.
-		// Проверяем именно валидацию: соединение тут же отменяется
-		let ws = await makeStreaming(timeout: 1)
-		for endpoint in ["wss://example.com/stream", wsBase + "/silent"] {
-			let (input, cont) = makeInput()
-			cont.finish()
-			_ = try await ws.establishStream(endpoint: endpoint, headers: [:], inputStream: input)
+		// Валидация проверяется напрямую: поднимать сокет (тем более наружу)
+		// ради проверки разбора строки незачем
+		for endpoint in [
+			"wss://example.com/stream",
+			"https://example.com/stream",
+			"ws://127.0.0.1:8901/echo",
+			"http://localhost:8901/echo"
+		] {
+			XCTAssertNoThrow(
+				try WebSocketNetworkStreaming.validate(endpoint: endpoint),
+				"endpoint: \(endpoint)"
+			)
 		}
-		await ws.cancel()
+	}
+
+	func testUnsupportedSchemeIsRejectedEvenOnLoopback() throws {
+		// Исключение для loopback касается только ws/http: иначе file:// или
+		// ftp:// проходили бы валидацию и падали поздно, уже снеся живой стрим
+		for endpoint in ["file://localhost/tmp/x", "ftp://localhost/x"] {
+			XCTAssertThrowsError(try WebSocketNetworkStreaming.validate(endpoint: endpoint)) { error in
+				XCTAssertEqual((error as? URLError)?.code, .unsupportedURL, "endpoint: \(endpoint)")
+			}
+		}
 	}
 
 	func testRejectedEndpointKeepsCurrentStream() async throws {
@@ -845,10 +860,27 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 	func testCookieValueWithSeparatorOrControlIsRejected() async throws {
 		let ws = await makeStreaming()
 		let url = URL(string: "wss://example.com/path")!
-		for value in ["a\nb", "a\rb", "a\u{0}b", "a;b", "a,b", "a=b"] {
+		for value in ["a\nb", "a\rb", "a\u{0}b", "a;b", "a,b"] {
 			let cookie = await ws.createCookie(name: "sessionid", value: value, for: url)
 			XCTAssertNil(cookie, "Значение \(value.debugDescription) должно отбраковываться")
 		}
+	}
+
+	func testBase64PaddedCookieValueIsAccepted() async throws {
+		// '=' внутри значения легален (RFC 6265 4.1.1) и обязателен для base64
+		// с паддингом: отбраковка по нему молча роняла бы авторизацию
+		let ws = await makeStreaming()
+		let url = URL(string: "wss://example.com/path")!
+		let token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0=="
+		let cookie = await ws.createCookie(name: "authtoken", value: token, for: url)
+		XCTAssertEqual(cookie?.value, token)
+	}
+
+	func testBase64PaddedCookieReachesHandshakeHeader() async throws {
+		let token = "YWJjZA=="
+		let ws = await makeStreaming(cookies: [.auth: token])
+		let header = await cookieHeader(ws, for: wsBase + "/cookie")
+		XCTAssertTrue(header.contains("authtoken=\(token)"), "Cookie header: \(header)")
 	}
 
 	/// Собирает Cookie-заголовок ровно так, как это делает рукопожатие, но без
@@ -900,6 +932,50 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		let header = await cookieHeader(ws, for: wsBase + "/cookie")
 		XCTAssertTrue(header.contains("scope=SPECIFIC"), "Cookie header: \(header)")
 		XCTAssertFalse(header.contains("BROAD"), "Широкая кука должна быть перекрыта: \(header)")
+	}
+
+	func testLongerPathWinsOverHostOnlyShallowCookie() async throws {
+		// RFC 6265 5.4: длина path важнее домена. Длину домена как признак
+		// специфичности брать нельзя — Foundation ставит доменной куке ведущую
+		// точку, из-за чего широкая кука оказывается «длиннее» host-only
+		let broadDomainDeepPath = HTTPCookie(properties: [
+			.name: "pref", .value: "DEEP", .domain: ".example.com", .path: "/v1/stream"
+		])!
+		let hostOnlyRootPath = HTTPCookie(properties: [
+			.name: "pref", .value: "SHALLOW", .domain: "api.example.com", .path: "/"
+		])!
+		HTTPCookieStorage.shared.setCookie(broadDomainDeepPath)
+		HTTPCookieStorage.shared.setCookie(hostOnlyRootPath)
+		defer {
+			HTTPCookieStorage.shared.deleteCookie(broadDomainDeepPath)
+			HTTPCookieStorage.shared.deleteCookie(hostOnlyRootPath)
+		}
+
+		let ws = await makeStreaming(cookies: [.session: "abc123"])
+		let header = await cookieHeader(ws, for: "wss://api.example.com/v1/stream")
+		XCTAssertTrue(header.contains("pref=DEEP"), "Cookie header: \(header)")
+		XCTAssertFalse(header.contains("SHALLOW"), "Короткий path должен проиграть: \(header)")
+	}
+
+	func testHostOnlyCookieWinsOverDomainCookieAtSamePath() async throws {
+		// При равном path конкретнее host-only кука, а не доменная
+		let domainCookie = HTTPCookie(properties: [
+			.name: "pref", .value: "DOMAIN", .domain: ".example.com", .path: "/"
+		])!
+		let hostOnlyCookie = HTTPCookie(properties: [
+			.name: "pref", .value: "HOST", .domain: "api.example.com", .path: "/"
+		])!
+		HTTPCookieStorage.shared.setCookie(domainCookie)
+		HTTPCookieStorage.shared.setCookie(hostOnlyCookie)
+		defer {
+			HTTPCookieStorage.shared.deleteCookie(domainCookie)
+			HTTPCookieStorage.shared.deleteCookie(hostOnlyCookie)
+		}
+
+		let ws = await makeStreaming(cookies: [.session: "abc123"])
+		let header = await cookieHeader(ws, for: "wss://api.example.com/")
+		XCTAssertTrue(header.contains("pref=HOST"), "Cookie header: \(header)")
+		XCTAssertFalse(header.contains("DOMAIN"), "Доменная кука должна проиграть host-only: \(header)")
 	}
 
 	func testOwnCookieOverridesSameNameFromSharedStorage() async throws {
