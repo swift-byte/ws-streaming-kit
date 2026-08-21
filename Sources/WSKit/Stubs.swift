@@ -86,7 +86,10 @@ extension KidsURLSession: URLSessionWebSocketDelegate, URLSessionTaskDelegate {
 		completionHandler: @Sendable @escaping (URLRequest?) -> Void
 	) {
 		guard let delegate = task.delegate else {
-			completionHandler(request)
+			// Fail-closed, как и прод-гард: без делегата подтвердить origin
+			// нечем, а следовать за редиректом с прикреплёнными куками SDK —
+			// ровно то, что гард и запрещает
+			completionHandler(nil)
 			return
 		}
 		delegate.urlSession(

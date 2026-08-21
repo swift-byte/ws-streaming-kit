@@ -73,6 +73,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
+	private enum CookieRejection {
+		case name
+		case value
+	}
+
 	/// Метка вытеснения. Ставит её тот, кто занимает место стрима; читают двое:
 	/// connectTask вытесняемого (через `outcome(for:terminalError:)`) и сам
 	/// establishStream, если вытеснение случилось в окне сбора кук и connectTask
@@ -233,6 +238,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	///   стрим сохраняется.
 	/// - Прекращение чтения выходного стрима потребителем закрывает соединение:
 	///   стрим и есть владение им.
+	/// - Очередь выходного стрима ограничена двумя порогами сразу — 1024 кадра
+	///   и 8 МиБ; оба заданы константами, ручки настройки нет. Переполнение —
+	///   не backpressure и не пауза: стрим падает с `.nsError`, соединение
+	///   закрывается, и продолжить его нельзя — нужен новый `establishStream`.
+	///   Выбрано намеренно: залипший потребитель на iOS иначе растёт до jetsam,
+	///   а jetsam убивает всё приложение, а не один стрим.
 	/// - Пара из `headers` не уходит на провод, если имя не RFC 7230 token,
 	///   значение содержит управляющие символы, имя принадлежит транспорту
 	///   (Connection, Upgrade, Host, Content-Length, Transfer-Encoding,
@@ -551,7 +562,16 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// когда didCloseWith не доехал: свой 1000 затёр бы чужой 1011, и ошибка
 	/// сервера пришла бы потребителю тихим финишем. Когда задача пуста, вежливое
 	/// закрытие ничего не стоит и приносит пользу: на iOS сервер этот код видит
-	/// (замерено), и «пользователь договорил» отличимо от «связь оборвалась»
+	/// (замерено), и «пользователь договорил» отличимо от «связь оборвалась».
+	///
+	/// Проверка и запись не атомарны: между чтением `closeCode` и `cancel(with:)`
+	/// делегатная очередь может записать чужой код, и наш 1000 его затрёт. Окно
+	/// оставлено сознательно. Во-первых, сузить его нечем: задача — не наш стейт,
+	/// а единственная альтернатива, прогнать решение через актор, не годится для
+	/// deinit, где вызов синхронный. Во-вторых, цена промаха мала: код, пришедший
+	/// ровно в этот момент, доедет до потребителя аргументом `didCloseWith` —
+	/// восстановление из `task.closeCode` нужно только там, где этого вызова
+	/// не было вовсе
 	static func closeGracefullyIfUnclaimed(_ task: URLSessionWebSocketTask?) {
 		guard let task else { return }
 		guard task.closeCode == .invalid else {
@@ -651,13 +671,24 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			/// принята: наша отмена может опередить CFNetwork и подменить
 			/// причину на -999, сведя исход к тихому финишу. Тихий финиш без
 			/// ответа потребитель переживёт и повторит; неверный ответ — нет.
-			/// Но если сервер УЖЕ попрощался (код в задаче не .invalid — свой мы
-			/// туда не пишем), закрывать нечего: send упал как следствие, а
-			/// отмена оборвала бы читателя посреди дренажа и срезала хвост
+			/// Но если сервер УЖЕ попрощался, закрывать нечего: send упал как
+			/// следствие, а отмена оборвала бы читателя посреди дренажа и
+			/// срезала хвост. Признак — код СЕРВЕРА в задаче: свой там мог бы
+			/// оказаться только из closeGracefullyIfUnclaimed, а тот работает
+			/// при teardown, где эта задача уже отменена и мы вышли выше.
+			/// Решение принимается один раз: страховку снимает лишь тот, кто
+			/// закрывает, иначе обречённый стрим остался бы и без дедлайна,
+			/// и без закрытия
 			func failUplink(_ error: Error) async {
 				guard Task.isCancelled == false else { return }
-				await self?.noteUplinkFailure(generation: requested, error: error as NSError)
-				guard Task.isCancelled == false, task.closeCode == .invalid else { return }
+				let closing = WebSocketNetworkStreamingDelegate
+					.isPeerCloseCode(task.closeCode) == false
+				await self?.noteUplinkFailure(
+					generation: requested,
+					error: error as NSError,
+					closing: closing
+				)
+				guard Task.isCancelled == false, closing else { return }
 				task.cancel()
 			}
 
@@ -705,12 +736,14 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// сводится к трём выше. Настоящее решение — отдельный случай в контракте
 	/// SDK, и вводить его надо синхронно с вызывающим кодом.
 	/// Цена принята потому, что альтернатива хуже: см. отправку терминатора
-	private func noteUplinkFailure(generation requested: Int, error: NSError) {
+	/// - Parameter closing: закрываем ли мы сокет вслед за этим. Только тогда и
+	///   снимаем страховку: иначе таймаут выстрелил бы в окне дренажа и
+	///   подменил причину. Когда сокет остаётся жить, дедлайн — единственное,
+	///   что не даст обречённому стриму висеть до платформенного
+	private func noteUplinkFailure(generation requested: Int, error: NSError, closing: Bool) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
-		// Страховку снимаем: сокет закрывается следом, и таймаут, выстрелив в
-		// окне дренажа, подменил бы причину
-		disarmTimeout()
+		if closing { disarmTimeout() }
 	}
 
 	/// Заводит читателя и отдаёт сигнал его завершения; nil — поколение сдвинулось.
@@ -966,8 +999,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					Logger.assistant.error(S("Stored cookie dropped, name reserved: \(Self.logSafe(cookie.name))"))
 					return false
 				}
-				guard Self.isSerializableCookie(name: cookie.name, value: cookie.value) else {
-					Logger.assistant.error(S("Stored cookie dropped, not serializable: \(Self.logSafe(cookie.name))"))
+				if let rejection = Self.cookieRejection(name: cookie.name, value: cookie.value) {
+					Logger.assistant.error(S("Stored cookie dropped (\(rejection)): \(Self.logSafe(cookie.name))"))
 					return false
 				}
 				return true
@@ -1090,14 +1123,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {
-		// Имя и значение отбраковываются по разным правилам, поэтому и в логе
-		// разделены: иначе диагностика вела бы не к той половине пары
-		guard Self.isToken(name) else {
-			Logger.assistant.error(S("Cookie rejected, name is not a token: \(Self.logSafe(name))"))
-			return nil
-		}
-		guard Self.isCookieOctets(value) else {
-			Logger.assistant.error(S("Cookie rejected, value has control characters or separators: \(Self.logSafe(name))"))
+		if let rejection = Self.cookieRejection(name: name, value: value) {
+			Logger.assistant.error(S("Cookie rejected (\(rejection)): \(Self.logSafe(name))"))
 			return nil
 		}
 		let cookie = HTTPCookie(properties: [
@@ -1128,7 +1155,16 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// заголовок ими не разорвать. '=' в значении легален и обязателен для
 	/// base64 с паддингом — сервер режет пару по ПЕРВОМУ '='
 	private static func isSerializableCookie(name: String, value: String) -> Bool {
-		isToken(name) && isCookieOctets(value)
+		cookieRejection(name: name, value: value) == nil
+	}
+
+	/// Какая половина пары не проходит — или nil, если проходит вся. Одно
+	/// определение «сериализуемой» куки на оба пути (свои и из стоража):
+	/// разъехавшись, они снова открыли бы дыру со смуглингом
+	private static func cookieRejection(name: String, value: String) -> CookieRejection? {
+		if isToken(name) == false { return .name }
+		if isCookieOctets(value) == false { return .value }
+		return nil
 	}
 
 	private static func isCookieOctets(_ text: String) -> Bool {
