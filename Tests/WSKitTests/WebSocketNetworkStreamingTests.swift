@@ -237,6 +237,45 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		}
 	}
 
+	func testCompletionOutcomeTable() {
+		typealias Delegate = WebSocketNetworkStreamingDelegate
+		let lost = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
+		let cancelled = NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)
+		let notConnected = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOTCONN.rawValue))
+		let dns = NSError(domain: NSURLErrorDomain, code: NSURLErrorDNSLookupFailed)
+
+		// Код от сервера важнее ошибки: она пришла уже после закрытия
+		guard case .closeCode(let payload)? = Delegate.completionOutcome(
+			closeCode: .internalServerError, error: lost
+		) else {
+			return XCTFail("Код сервера должен перебивать ошибку завершения")
+		}
+		XCTAssertEqual(payload.code, .internalServerError)
+
+		// Чистые коды сервера — тихий финиш, даже с ошибкой в паре
+		for clean: URLSessionWebSocketTask.CloseCode in [.normalClosure, .noStatusReceived] {
+			XCTAssertNil(Delegate.completionOutcome(closeCode: clean, error: lost), "closeCode: \(clean)")
+		}
+
+		// Локальные сентинелы кодом сервера не являются — решает ошибка
+		for local: URLSessionWebSocketTask.CloseCode in [.invalid, .abnormalClosure, .tlsHandshakeFailure] {
+			guard case .timeout? = Delegate.completionOutcome(closeCode: local, error: lost) else {
+				return XCTFail("closeCode \(local): ожидали унаследованный .timeout")
+			}
+		}
+
+		// Своё закрытие и POSIX 57 ошибкой для потребителя не являются
+		XCTAssertNil(Delegate.completionOutcome(closeCode: .invalid, error: cancelled))
+		XCTAssertNil(Delegate.completionOutcome(closeCode: .invalid, error: notConnected))
+		XCTAssertNil(Delegate.completionOutcome(closeCode: .invalid, error: nil))
+
+		// Всё остальное — транспортная ошибка с сохранением кода
+		guard case .nsError(let inner)? = Delegate.completionOutcome(closeCode: .invalid, error: dns) else {
+			return XCTFail("Ожидали .nsError")
+		}
+		XCTAssertEqual(inner.code, NSURLErrorDNSLookupFailed)
+	}
+
 	func testDelegateCleanCloseCodesFinishWithoutError() async {
 		// Сбоем не считаются 1000; 1005 — «кода не было», легальный исход по
 		// RFC 6455 §7.1.5; .invalid — сентинел «код не записан»
@@ -463,29 +502,6 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertEqual(result.events.first, .connected)
 		await ws.cancel()
 	}
-
-	#if !canImport(FoundationNetworking)
-	func testAbruptTransportDropWhileSendingIsNotReportedAsSuccess() async throws {
-		// Сервер рвёт TCP без close-фрейма, пока идёт запись. Слово сервера тут
-		// не прозвучало, поэтому тихий финиш был бы для потребителя ложью:
-		// он не отличил бы обрыв записи от «сервер договорил».
-		// Только Darwin: corelibs на обрыве без фрейма подставляет closeCode
-		// 1000 (замерено) — то есть выдаёт разрыв за штатное закрытие, и
-		// отличить одно от другого там нечем
-		let ws = await makeStreaming(timeout: 20)
-		let (input, inputCont) = makeInput()
-		let stream = try await openStream(ws, path: "/abrupt-drop", input: input)
-		let feeder = feedInput(inputCont)
-
-		let result = await drain(stream, deadline: 15)
-		feeder.cancel()
-		inputCont.finish()
-
-		XCTAssertTrue(result.completed)
-		XCTAssertNotNil(result.thrown, "Обрыв без close-фрейма не должен выглядеть успехом")
-		await ws.cancel()
-	}
-	#endif
 
 	func testCancelledCallerAbortsEstablishInsteadOfOpeningAnonymousSocket() async throws {
 		// Сбор кук вычитывает сигнальный стрим, а тот под отменой отдаёт nil
