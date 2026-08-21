@@ -280,6 +280,19 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertNil(Delegate.completionOutcome(closeCode: .invalid, error: notConnected))
 		XCTAssertNil(Delegate.completionOutcome(closeCode: .invalid, error: nil))
 
+		// А вот 1006/1015 без пригодной ошибки — не «ничего не известно», а
+		// «фрейма не было»: закрытие ненормальное, молчать о нём нельзя
+		for abnormal: URLSessionWebSocketTask.CloseCode in [.abnormalClosure, .tlsHandshakeFailure] {
+			for paired in [nil, cancelled, notConnected] {
+				guard case .closeCode(let code)? = Delegate.completionOutcome(
+					closeCode: abnormal, error: paired
+				) else {
+					return XCTFail("closeCode \(abnormal) без пригодной ошибки: ожидали .closeCode")
+				}
+				XCTAssertEqual(code.code, abnormal)
+			}
+		}
+
 		// Всё остальное — транспортная ошибка с сохранением кода
 		guard case .nsError(let inner)? = Delegate.completionOutcome(closeCode: .invalid, error: dns) else {
 			return XCTFail("Ожидали .nsError")
@@ -933,6 +946,29 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 				try WebSocketNetworkStreaming.validate(endpoint: endpoint),
 				"endpoint: \(endpoint)"
 			)
+		}
+	}
+
+	func testAmbiguousLoopbackSpellingsAreRejected() throws {
+		// Резолвер читает октет с ведущим нулём ВОСЬМЕРИЧНО: 0127.1 у него
+		// 87.0.0.1 — публичный адрес (замерено через getaddrinfo). Приняв такую
+		// запись за loopback, мы отправили бы туда куки SDK открытым текстом.
+		// 0x7f.1 и 2130706433 он тоже разворачивает в 127.0.0.1 — повторять
+		// inet_aton не будем, отвергаем всё, кроме канонической записи
+		for endpoint in [
+			"ws://0127.1:8901/echo",
+			"ws://0177.0.0.1:8901/echo",
+			"ws://127.1:8901/echo",
+			"ws://0x7f.1:8901/echo",
+			"ws://2130706433:8901/echo"
+		] {
+			XCTAssertThrowsError(try WebSocketNetworkStreaming.validate(endpoint: endpoint)) { error in
+				XCTAssertEqual(
+					(error as? URLError)?.code,
+					.appTransportSecurityRequiresSecureConnection,
+					"endpoint: \(endpoint)"
+				)
+			}
 		}
 	}
 

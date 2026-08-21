@@ -177,7 +177,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// Порядок как в cancel(generation:): ввод — до разрыва сокета, иначе
 		// inflight-send эскалирует штатное разрушение как сбой аплинка
 		inputTask?.cancel()
-		webSocketTask?.cancel()
+		webSocketTask?.cancel(with: .normalClosure, reason: nil)
 		outputTask?.cancel()
 		connectTask?.cancel()
 		timer?.cancel()
@@ -461,11 +461,27 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		if canonical == "localhost" || canonical == "::1" || canonical == "0:0:0:0:0:0:0:1" {
 			return true
 		}
-		// 127.1 и 127.0.1 — те же формы, что разворачивает системный резолвер,
-		// а первый октет сравнивается числом: «0127» тоже 127
+		// Только каноническая запись из четырёх десятичных октетов без ведущих
+		// нулей. Резолвер понимает и 127.1, и 0x7f.1, и 2130706433, и октет с
+		// ведущим нулём читает ВОСЬМЕРИЧНО — «0127.1» у него 87.0.0.1, адрес
+		// публичный (замерено). Повторять inet_aton здесь нельзя: любое
+		// расхождение — это плейнтекст с куками SDK не туда, куда мы решили.
+		// Нестандартную запись отвергаем; развернуть её до 127.0.0.1 — дело
+		// вызывающего, а осознанный плейнтекст открывается allowsInsecureEndpoint
 		let octets = canonical.split(separator: ".", omittingEmptySubsequences: false)
-		guard (2...4).contains(octets.count), octets.allSatisfy({ UInt8($0) != nil }) else { return false }
-		return UInt8(octets[0]) == 127
+		guard octets.count == 4, octets.allSatisfy(Self.isPlainDecimalOctet) else { return false }
+		return octets[0] == "127"
+	}
+
+	private static func isPlainDecimalOctet(_ text: Substring) -> Bool {
+		guard (1...3).contains(text.count),
+			  text.allSatisfy(\.isASCII),
+			  text.allSatisfy(\.isNumber),
+			  text == "0" || text.hasPrefix("0") == false,
+			  UInt8(text) != nil else {
+			return false
+		}
+		return true
 	}
 
 	// MARK: - Private Methods
@@ -480,11 +496,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// эскалировался как сбой аплинка
 		inputTask?.cancel()
 		inputTask = nil
-		// cancel() без кода: любой код, выставленный своей инициативой, попадает
-		// в closeCode задачи (замерено) и читается делегатом как слово сервера.
-		// На проводе ничего не теряем — close-фрейм при cancel(with:) всё равно
-		// не доставляется (замерено на обеих платформах)
-		webSocketTask?.cancel()
+		// Штатное закрытие с кодом: сервер должен отличать «пользователь
+		// договорил» от «связь оборвалась». Своим словом сервера этот код уже
+		// не притворится — completionOutcome доверяет только кодам С ПРИЧИНОЙ,
+		// а чистый разбирает наравне с ошибкой завершения
+		webSocketTask?.cancel(with: .normalClosure, reason: nil)
 		webSocketTask = nil
 		// Взводим обратно, потому что слот освобождается вместе с остальными:
 		// следующий стрим начинается со страховкой, а снятие, сделанное для
@@ -609,7 +625,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					await noteSendFailure(error, closing: false)
 				}
 			}
-			guard Task.isCancelled == false, sendFailed == false else { return }
+			// Терминатор шлём и после сбоя: если транспорт всё-таки жив, сервер
+			// дождётся конца ввода и ответит; если нет — отправка упадёт и мы
+			// закроем сокет. Пропустить его значило бы оставить сервер ждать
+			// аплинк, а потребителя — висеть до платформенного дедлайна
+			guard Task.isCancelled == false else { return }
 			Logger.assistant.info(S("Input stream finished"))
 			do {
 				try await task.send(.data(Self.inputTerminator))
@@ -647,8 +667,10 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	/// дренажа, подменил бы причину
 	/// - Parameter closing: закрываем ли мы сокет вслед за этим. Страховку
 	///   снимаем только тогда: иначе таймаут гонялся бы с нашим же teardown.
-	///   Когда сокет остаётся жить, дедлайн — единственное, что не даст
-	///   обречённому стриму висеть до платформенного
+	///   Оставлять её взведённой при `closing: false` смысла немного — первое
+	///   же принятое сообщение её уже сняло, — но и снимать нечего: стрим здесь
+	///   ограничивает не она, а отправка терминатора, которая после конца ввода
+	///   либо доедет, либо закроет сокет
 	private func noteUplinkFailure(generation requested: Int, error: NSError, closing: Bool) {
 		guard requested == generation else { return }
 		Logger.assistant.error(S("WebSocket input send failed: \(error.domain) \(error.code)"))
@@ -747,7 +769,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 						// Доставлен кадр или нет — неизвестно. Рвать рабочий
 						// стрим по неизвестному случаю хуже, чем продолжить:
 						// диагноз «переполнение» был бы выдуманным. Молчать
-						// тоже нельзя — логируем, один раз
+						// тоже нельзя — логируем, один раз.
+						// В вес очереди кадр не идёт: глубину даёт только
+						// `.enqueued`, а выдумывать её — портить учёт
 						if warnedUnknownYield == false {
 							warnedUnknownYield = true
 							Logger.assistant.error(S("Unknown yield result, frame delivery unverified"))
@@ -966,15 +990,20 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		// прочитались, и рукопожатие уходило бы вовсе без авторизации
 		let (signal, signalContinuation) = AsyncStream<ReservedCookieRead>.makeStream()
 
+		// detached по той же причине, что inputTask и outputTask: Task {} внутри
+		// актора наследует изоляцию и держит его СИЛЬНО, а зависшее чтение
+		// (кейчейн на заблокированном устройстве — тот самый сценарий, ради
+		// которого тут дедлайн) тогда не давало бы актору деинициализироваться,
+		// и сокет с сессией текли бы до конца процесса
 		let fetches = names.map { name in
-			Task {
+			Task.detached {
 				let value = await storage.getCookie(name: name)
 				signalContinuation.yield(ReservedCookieRead(name: name, value: value))
 			}
 		}
 		// Дедлайн закрывает сигнальный стрим — цикл заканчивается тем, что
 		// успело прийти, а недочитанное видно по остатку счётчика
-		let deadline = Task {
+		let deadline = Task.detached {
 			try? await Task.sleep(nanoseconds: Self.cookieCollectionNanoseconds)
 			signalContinuation.finish()
 		}
@@ -1284,8 +1313,13 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		if isPeerCloseCode(closeCode), isCleanClosure(closeCode) == false {
 			return closeFrameOutcome(closeCode)
 		}
-		guard let error, isCleanTransportError(error) == false else { return nil }
-		return .transportFailure(error)
+		if let error, isCleanTransportError(error) == false {
+			return .transportFailure(error)
+		}
+		// Ошибки нет либо она наша. Но 1006/1015 — не «ничего не известно», а
+		// «фрейма не было»: закрытие ненормальное, и молчать о нём нельзя
+		guard closeCode == .abnormalClosure || closeCode == .tlsHandshakeFailure else { return nil }
+		return .closeCode(NetworkStreamingOutputError(code: closeCode))
 	}
 
 	/// Исход по коду, пришедшему во фрейме: код и есть вся история
