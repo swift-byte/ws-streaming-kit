@@ -1093,9 +1093,10 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		XCTAssertFalse(header.contains("DOMAIN"), "Доменная кука должна проиграть host-only: \(header)")
 	}
 
-	func testOwnCookieOverridesSameNameFromSharedStorage() async throws {
+	func testStoredCookieWithReservedNameIsRejectedNotOverridden() async throws {
 		// Зарезервированные имена из стоража не берутся вовсе: чужая кука
-		// хост-приложения не должна подменять авторизацию SDK
+		// хост-приложения не должна подменять авторизацию SDK. Отсекает именно
+		// фильтр по имени, а не порядок слияния — до слияния она не доходит
 		let stale = HTTPCookie(properties: [
 			.name: "sessionid", .value: "STALE", .domain: "127.0.0.1", .path: "/"
 		])!
