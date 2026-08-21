@@ -112,7 +112,3 @@ enum Logger {
 }
 
 func S(_ string: String) -> String { string }
-
-extension Collection {
-	var isNotEmpty: Bool { isEmpty == false }
-}

@@ -5,8 +5,8 @@ import FoundationNetworking
 @testable import WSKit
 
 /// Интеграционные тесты требуют запущенного ws_test_server.py:
-///   WS-сервер на 127.0.0.1:8901 (пути /echo, /push3, /sink, /cookie,
-///   /close1000, /close1011, /msg-then-silent, /push-after-3, /silent)
+///   WS-сервер на 127.0.0.1:8901 (пути /echo, /push3, /sink, /cookie, /headers,
+///   /flood, /close1000, /close1011, /msg-then-silent, /push-after-3, /silent)
 ///   и «молчащий» TCP-акцептор на 127.0.0.1:8902 (для теста таймаута).
 final class WebSocketNetworkStreamingTests: XCTestCase {
 
@@ -180,7 +180,10 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		URLSessionWebSocketTask
 	) {
 		let (stream, continuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
-		let delegate = WebSocketNetworkStreamingDelegate(continuation: continuation)
+		let delegate = WebSocketNetworkStreamingDelegate(
+			origin: URL(string: "wss://origin.example/stream")!,
+			continuation: continuation
+		)
 		let session = URLSession(configuration: .default)
 		// Задача не резюмируется — нужна только как аргумент делегатных методов
 		let task = session.webSocketTask(with: URLRequest(url: URL(string: "ws://127.0.0.1:1")!))
@@ -739,5 +742,306 @@ final class WebSocketNetworkStreamingTests: XCTestCase {
 		try await Task.sleep(nanoseconds: 700_000_000)
 		XCTAssertNil(weakWS, "Актор должен деинициализироваться — retain cycle через задачи")
 		inputCont.finish()
+	}
+
+	// MARK: - Unit: валидация endpoint
+
+	func testEndpointWithoutHostThrowsBadURL() async throws {
+		// Пустая строка и схема без хоста: URL(string:) разбирает их
+		// по-разному на Darwin и corelibs, поэтому отбраковка идёт по составу
+		let ws = await makeStreaming()
+		for endpoint in ["", "ws:///path", "not a url"] {
+			let (input, cont) = makeInput()
+			cont.finish()
+			do {
+				_ = try await ws.establishStream(endpoint: endpoint, headers: [:], inputStream: input)
+				XCTFail("Ожидали URLError(.badURL) для \(endpoint.debugDescription)")
+			} catch let error as URLError {
+				XCTAssertEqual(error.code, .badURL, "endpoint: \(endpoint.debugDescription)")
+			}
+		}
+	}
+
+	func testInsecureRemoteEndpointIsRejected() async throws {
+		// Транспорт без TLS вне loopback унёс бы SDK-куки открытым текстом
+		let ws = await makeStreaming()
+		for endpoint in ["ws://example.com/stream", "http://example.com/stream"] {
+			let (input, cont) = makeInput()
+			cont.finish()
+			do {
+				_ = try await ws.establishStream(endpoint: endpoint, headers: [:], inputStream: input)
+				XCTFail("Ожидали отказ для \(endpoint)")
+			} catch let error as URLError {
+				XCTAssertEqual(error.code, .appTransportSecurityRequiresSecureConnection, "endpoint: \(endpoint)")
+			}
+		}
+	}
+
+	func testSecureAndLoopbackEndpointsPassValidation() async throws {
+		// wss/https проходят с любым хостом, ws/http — только на loopback.
+		// Проверяем именно валидацию: соединение тут же отменяется
+		let ws = await makeStreaming(timeout: 1)
+		for endpoint in ["wss://example.com/stream", wsBase + "/silent"] {
+			let (input, cont) = makeInput()
+			cont.finish()
+			_ = try await ws.establishStream(endpoint: endpoint, headers: [:], inputStream: input)
+		}
+		await ws.cancel()
+	}
+
+	func testRejectedEndpointKeepsCurrentStream() async throws {
+		// Отказ валидации — единственный путь без teardown: действующий стрим
+		// не должен пострадать от невалидного вызова
+		let ws = await makeStreaming(timeout: 10)
+		let stream = try await openStream(ws, path: "/silent")
+		let reader = StreamReader(stream)
+		let first = try await reader.next()
+		XCTAssertEqual(first, .connected)
+
+		let (input, cont) = makeInput()
+		cont.finish()
+		do {
+			_ = try await ws.establishStream(endpoint: "ws://example.com/x", headers: [:], inputStream: input)
+			XCTFail("Ожидали отказ")
+		} catch is URLError {}
+
+		// Живой стрим не вытеснен: следующего события нет, но и завершения тоже
+		enum Outcome: Sendable { case finished, event, failed(String), stillAlive }
+		let outcome = try await withThrowingTaskGroup(of: Outcome.self) { group -> Outcome in
+			group.addTask {
+				do {
+					return try await reader.next() == nil ? .finished : .event
+				} catch {
+					return .failed(String(describing: error))
+				}
+			}
+			group.addTask {
+				try? await Task.sleep(nanoseconds: 1_500_000_000)
+				return .stillAlive
+			}
+			let winner = try await group.next() ?? .stillAlive
+			group.cancelAll()
+			return winner
+		}
+		guard case .stillAlive = outcome else {
+			return XCTFail("Отказ валидации не должен рвать действующий стрим; получили \(outcome)")
+		}
+		await ws.cancel()
+	}
+
+	// MARK: - Unit: гигиена кук и заголовков
+
+	func testCookieValueWithFormatCharacterIsAccepted() async throws {
+		// Cf-символы (U+FEFF, U+200B, мягкий перенос) заголовок не разрывают —
+		// отбраковка по ним молча убивала бы валидный токен
+		let ws = await makeStreaming()
+		let url = URL(string: "wss://example.com/path")!
+		for value in ["a\u{FEFF}b", "a\u{200B}b", "a\u{00AD}b"] {
+			let cookie = await ws.createCookie(name: "sessionid", value: value, for: url)
+			XCTAssertNotNil(cookie, "Значение \(value.debugDescription) должно приниматься")
+		}
+	}
+
+	func testCookieValueWithSeparatorOrControlIsRejected() async throws {
+		let ws = await makeStreaming()
+		let url = URL(string: "wss://example.com/path")!
+		for value in ["a\nb", "a\rb", "a\u{0}b", "a;b", "a,b", "a=b"] {
+			let cookie = await ws.createCookie(name: "sessionid", value: value, for: url)
+			XCTAssertNil(cookie, "Значение \(value.debugDescription) должно отбраковываться")
+		}
+	}
+
+	/// Собирает Cookie-заголовок ровно так, как это делает рукопожатие, но без
+	/// URLSession: corelibs игнорирует httpShouldHandleCookies = false и
+	/// подставляет стораж поверх собранного вручную заголовка, из-за чего
+	/// через живой сокет логику слияния на Linux не проверить
+	private func cookieHeader(
+		_ ws: WebSocketNetworkStreaming,
+		for endpoint: String
+	) async -> String {
+		let url = URL(string: endpoint)!
+		var request = URLRequest(url: url)
+		await ws.addCookies(to: &request, for: url)
+		return request.value(forHTTPHeaderField: "Cookie") ?? ""
+	}
+
+	func testSharedCookieWithSeparatorCannotSmuggleReservedNames() async throws {
+		// Чужое значение с ';' склеивается в Cookie дословно и протаскивает
+		// произвольные пары — в том числе повторный sessionid, который
+		// last-wins сервер и примет. Фильтр по имени такое не ловит
+		let smuggler = HTTPCookie(properties: [
+			.name: "zz_analytics",
+			.value: "ok; sessionid=ATTACKER; authtoken=ATTACKER",
+			.domain: "127.0.0.1",
+			.path: "/"
+		])!
+		HTTPCookieStorage.shared.setCookie(smuggler)
+
+		let ws = await makeStreaming(cookies: [.session: "REAL", .auth: "REAL"])
+		let header = await cookieHeader(ws, for: wsBase + "/cookie")
+		XCTAssertFalse(header.contains("ATTACKER"), "Кука-контрабандист должна быть отброшена: \(header)")
+		XCTAssertFalse(header.contains("zz_analytics"), "Невалидное значение не должно попадать в заголовок: \(header)")
+		XCTAssertTrue(header.contains("sessionid=REAL"), "Своя кука должна остаться: \(header)")
+	}
+
+	func testMoreSpecificStoredCookieOverridesBroader() async throws {
+		// Одноимённые куки схлопываются по имени: побеждает самая специфичная,
+		// иначе рядом со свежим значением уезжало бы протухшее
+		let broad = HTTPCookie(properties: [
+			.name: "scope", .value: "BROAD", .domain: "127.0.0.1", .path: "/"
+		])!
+		let specific = HTTPCookie(properties: [
+			.name: "scope", .value: "SPECIFIC", .domain: "127.0.0.1", .path: "/cookie"
+		])!
+		HTTPCookieStorage.shared.setCookie(broad)
+		HTTPCookieStorage.shared.setCookie(specific)
+
+		let ws = await makeStreaming(cookies: [.session: "abc123"])
+		let header = await cookieHeader(ws, for: wsBase + "/cookie")
+		XCTAssertTrue(header.contains("scope=SPECIFIC"), "Cookie header: \(header)")
+		XCTAssertFalse(header.contains("BROAD"), "Широкая кука должна быть перекрыта: \(header)")
+	}
+
+	func testOwnCookieOverridesSameNameFromSharedStorage() async throws {
+		// Зарезервированные имена из стоража не берутся вовсе: чужая кука
+		// хост-приложения не должна подменять авторизацию SDK
+		let stale = HTTPCookie(properties: [
+			.name: "sessionid", .value: "STALE", .domain: "127.0.0.1", .path: "/"
+		])!
+		HTTPCookieStorage.shared.setCookie(stale)
+
+		let ws = await makeStreaming(cookies: [.session: "FRESH"])
+		let header = await cookieHeader(ws, for: wsBase + "/cookie")
+		XCTAssertTrue(header.contains("sessionid=FRESH"), "Cookie header: \(header)")
+		XCTAssertFalse(header.contains("STALE"), "Одноимённая кука из стоража должна быть перекрыта: \(header)")
+	}
+
+	func testHeaderWithControlCharacterIsSkippedAndValidOneSurvives() async throws {
+		// Foundation отбрасывает значение с CRLF вместе со всем заголовком и
+		// молча — отбраковываем сами, чтобы отказ был хотя бы в логе
+		let ws = await makeStreaming(timeout: 10)
+		let stream = try await openStream(ws, path: "/headers", headers: [
+			"X-Good": "fine",
+			"X-Bad-Value": "a\r\nX-Injected: 1",
+			"X-Bad\r\nName": "v"
+		])
+		var iterator = stream.makeAsyncIterator()
+		_ = try await iterator.next() // .connected
+		guard case .received(let data)? = try await iterator.next() else {
+			return XCTFail("Ожидали дамп заголовков рукопожатия")
+		}
+		let dump = String(decoding: data, as: UTF8.self)
+		XCTAssertTrue(dump.contains("X-Good: fine"), "Валидный заголовок должен доехать: \(dump)")
+		XCTAssertFalse(dump.contains("X-Injected"), "Инъекция не должна доехать: \(dump)")
+		XCTAssertFalse(dump.contains("X-Bad"), "Невалидные пары не должны доезжать: \(dump)")
+		await ws.cancel()
+	}
+
+	// MARK: - Unit: делегат -> редиректы и close-коды
+
+	func testDelegateNoStatusCloseFinishesCleanly() async {
+		// 1005 — «кода не было», легальный исход по RFC 6455, а не сбой
+		let (delegate, stream, session, task) = makeDelegatePair()
+		delegate.urlSession(session, webSocketTask: task, didCloseWith: .noStatusReceived, reason: nil)
+		let result = await drain(stream, deadline: 1)
+		XCTAssertTrue(result.completed)
+		XCTAssertNil(result.thrown)
+	}
+
+	func testDelegateRefusesCrossOriginRedirect() async throws {
+		// Куки прикреплены статическим заголовком, поэтому редирект на чужой
+		// хост унёс бы авторизацию SDK туда, где она не выдавалась
+		let (delegate, stream, session, task) = makeDelegatePair()
+		let response = HTTPURLResponse(
+			url: URL(string: "https://origin.example/stream")!,
+			statusCode: 302,
+			httpVersion: "HTTP/1.1",
+			headerFields: nil
+		)!
+		let redirected = URLRequest(url: URL(string: "https://attacker.example/stream")!)
+
+		let followed: URLRequest? = await withCheckedContinuation { continuation in
+			delegate.urlSession(
+				session,
+				task: task,
+				willPerformHTTPRedirection: response,
+				newRequest: redirected,
+				completionHandler: { continuation.resume(returning: $0) }
+			)
+		}
+		XCTAssertNil(followed, "Редирект на чужой origin должен отклоняться")
+
+		let result = await drain(stream, deadline: 1)
+		guard case .nsError(let inner)? = result.thrown as? NetworkStreamingError else {
+			return XCTFail("Ожидали .nsError, получили \(String(describing: result.thrown))")
+		}
+		XCTAssertEqual(inner.code, URLError.unsupportedURL.rawValue)
+	}
+
+	func testDelegateFollowsSameOriginRedirect() async throws {
+		// Смена пути внутри своего origin — обычный редирект, куки остаются дома
+		let (delegate, stream, session, task) = makeDelegatePair()
+		let response = HTTPURLResponse(
+			url: URL(string: "https://origin.example/stream")!,
+			statusCode: 302,
+			httpVersion: "HTTP/1.1",
+			headerFields: nil
+		)!
+		let redirected = URLRequest(url: URL(string: "https://origin.example/stream/v2")!)
+
+		let followed: URLRequest? = await withCheckedContinuation { continuation in
+			delegate.urlSession(
+				session,
+				task: task,
+				willPerformHTTPRedirection: response,
+				newRequest: redirected,
+				completionHandler: { continuation.resume(returning: $0) }
+			)
+		}
+		XCTAssertEqual(followed?.url, redirected.url)
+
+		let result = await drain(stream, deadline: 0.3)
+		XCTAssertTrue(result.timedOut, "Разрешённый редирект не должен завершать стрим")
+		XCTAssertNil(result.thrown)
+	}
+
+	// MARK: - Unit: маппинг сбоя аплинка
+
+	func testUplinkFailureSharesConnectionLostMappingWithDelegate() {
+		// Один и тот же обрыв не должен давать разный кейс в зависимости от
+		// того, кто заметил его первым — читатель или inflight-send
+		let lost = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
+		guard case .timeout = NetworkStreamingError.uplinkFailure(lost) else {
+			return XCTFail("Ожидали .timeout — тот же кейс, что у делегата")
+		}
+	}
+
+	func testUplinkFailureKeepsOtherErrorsAsNSError() {
+		let other = NSError(domain: NSPOSIXErrorDomain, code: Int(POSIXErrorCode.ENOTCONN.rawValue))
+		guard case .nsError(let inner) = NetworkStreamingError.uplinkFailure(other) else {
+			return XCTFail("Ожидали .nsError")
+		}
+		XCTAssertEqual(inner.code, Int(POSIXErrorCode.ENOTCONN.rawValue))
+	}
+
+	// MARK: - Integration: переполнение выходной очереди
+
+	func testOutputBufferOverflowFailsStreamInsteadOfGrowing() async throws {
+		// Залипший потребитель не должен раскачивать буфер без границы:
+		// стрим обязан упасть наблюдаемо, а не съесть память
+		let ws = await makeStreaming(timeout: 20)
+		let stream = try await openStream(ws, path: "/flood")
+		// Не читаем: буфер должен переполниться и завершить стрим ошибкой
+		try await Task.sleep(nanoseconds: 4_000_000_000)
+
+		let result = await drain(stream, deadline: 10)
+		XCTAssertTrue(result.completed)
+		guard case .nsError(let inner)? = result.thrown as? NetworkStreamingError else {
+			return XCTFail("Ожидали .nsError переполнения, получили \(String(describing: result.thrown))")
+		}
+		XCTAssertEqual(inner.code, NSURLErrorDataLengthExceedsMaximum)
+		XCTAssertEqual(result.events.first, .connected)
+		XCTAssertGreaterThan(result.events.count, 500, "Буферизованный префикс должен доехать до потребителя")
+		await ws.cancel()
 	}
 }

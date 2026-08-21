@@ -7,28 +7,40 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Private Types
 
-	/// Токен жизненного цикла стрима: вытеснитель помечает токен жертвы, и
-	/// жертва решает исход по СВОЕМУ токену. Флаг пишется и читается только
-	/// в изоляции актора; @unchecked — лишь ради захвата замыканием connectTask
+	/// Причина разрушения стрима, проставленная его инициатором. Пишет тот, кто
+	/// рвёт соединение; читает connectTask разрушаемого стрима, чтобы отличить
+	/// вытеснение (CancellationError) от явной отмены (тихий finish).
+	/// Оба поля читаются и пишутся только в изоляции актора; @unchecked нужен,
+	/// чтобы токен можно было захватить замыканием connectTask
 	private final class LifecycleToken: @unchecked Sendable {
 		var superseded = false
-	}
-
-	private enum TimeoutArbitration {
-		case pending
-		case firstMessage
-		case timedOut
-		case disarmed
+		var cancelled = false
 	}
 
 	// MARK: - Private Properties
 
 	private static let inputTerminator = Data([0x31])
 	private static let reservedCookieNames = Set(Cookies.allCases.map(\.rawValue))
-	// Граница ожидания дренажа: по истечении стрим финиширует без читателя.
-	// 0.5с резали хвост на медленном симуляторе (4/5 сообщений); в happy
-	// path дедлайн снимается сразу
+
+	/// Граница ожидания дренажа: по истечении стрим финиширует, не дожидаясь
+	/// читателя. В happy path снимается сразу, как только читатель завершился
 	private static let drainGraceNanoseconds: UInt64 = 3_000_000_000
+
+	/// Потолок кадра. Совпадает с платформенным дефолтом и задаётся явно, чтобы
+	/// верхняя граница памяти была видна в коде: кадр больше потолка закрывает
+	/// соединение кодом 1009
+	private static let maximumMessageSize = 1024 * 1024
+
+	/// Глубина очереди выходного стрима. Контракт прежний — потребитель обязан
+	/// вычитывать стрим, backpressure нет. Граница нужна лишь для того, чтобы
+	/// залипший потребитель или заливающий сервер давали наблюдаемый отказ,
+	/// а не безграничный рост (худший случай — outputBufferDepth × maximumMessageSize)
+	private static let outputBufferDepth = 1024
+
+	/// Дедлайны на живом соединении принадлежат нашему таймеру и вызывающему,
+	/// а не CFNetwork: дефолтные 60с timeoutIntervalForRequest рвали молчащий,
+	/// но здоровый сокет и обесценивали invalidate()
+	private static let platformRequestTimeout: TimeInterval = 24 * 60 * 60
 
 	private let kidsURLSession: KidsURLSession
 	private let cookieStorage: CookieStorage
@@ -38,7 +50,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	private var generation = 0
 	private var currentToken: LifecycleToken?
-	private var timeoutArbitration = TimeoutArbitration.pending
+	private var isTimeoutArmed = true
 	private var webSocketTask: URLSessionWebSocketTask?
 	private var outputTask: Task<Void, Never>?
 	private var inputTask: Task<Void, Never>?
@@ -47,8 +59,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Init
 
-	/// - Parameter timeout: секунды ожидания первого входящего сообщения;
-	///   значения вне 1...3600 клампятся к границам.
+	/// - Parameter timeout: секунды ожидания ПЕРВОГО входящего сообщения
+	///   (не только рукопожатия); значения вне 1...3600 клампятся к границам.
 	init(
 		kidsURLSession: KidsURLSession,
 		cookieStorage: CookieStorage,
@@ -62,6 +74,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		let configuration = URLSessionConfiguration.default
 		configuration.httpCookieStorage = .shared
+		configuration.timeoutIntervalForRequest = Self.platformRequestTimeout
 		handshakeCookieStorage = configuration.httpCookieStorage
 		session = URLSession(
 			configuration: configuration,
@@ -82,30 +95,41 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputTask?.cancel()
 		connectTask?.cancel()
 		timer?.cancel()
-		// invalidateAndCancel рвал соединение раньше, чем улетал close-фрейм
-		// строкой выше — graceful-закрытие превращалось в abnormal
+		// finishTasksAndInvalidate, а не invalidateAndCancel: последний рвал
+		// соединение раньше, чем улетал close-фрейм строкой выше
 		session.finishTasksAndInvalidate()
 	}
 
 	// MARK: - NetworkStreaming
 
 	/// Устанавливает соединение и возвращает стрим событий.
+	///
+	/// Порядок событий: `.connected`, затем `.received` в порядке прихода.
+	/// Исходы стрима:
+	/// - тихий `finish()` — штатное закрытие сервером или явный `cancel()`;
+	/// - `CancellationError` — стрим вытеснен следующим `establishStream`;
+	/// - `NetworkStreamingError.timeout` — первое сообщение не пришло за
+	///   `timeout` секунд; дедлайн тикает и ПОСЛЕ `.connected`, снять его можно
+	///   только через `invalidate()`;
+	/// - `NetworkStreamingError.closeCode` / `.nsError` — закрытие с кодом или
+	///   транспортная ошибка, включая переполнение очереди выходного стрима.
+	///
 	/// - Каждому вызову нужен свежий inputStream: AsyncStream одноразов и
 	///   single-consumer, повторная передача делит данные недетерминированно.
-	/// - До .connected inputStream не потребляется; при отказе на этой фазе он
+	/// - До `.connected` inputStream не потребляется; при отказе на этой фазе он
 	///   освобождается, продюсеру приходит onTermination.
-	/// - badURL — единственный отказ без teardown: действующий стрим сохраняется.
-	/// - Endpoint доверен целиком, включая схему: это SDK-внутренняя константа,
-	///   валидация даунгрейда wss→ws — забота конфигурации и ревью, не рантайма.
-	///   Пересмотреть, если endpoint станет конфигурируемым.
+	/// - Отказы валидации endpoint — единственные без teardown: действующий
+	///   стрим сохраняется.
+	/// - Заголовок с управляющими символами Foundation молча отбрасывает, поэтому
+	///   такие пары не отправляются, а логируются.
+	/// - Если `cookieStorage` не отдал зарезервированную куку, рукопожатие уйдёт
+	///   без неё: сервер закроет соединение, потребитель увидит `.closeCode`.
 	func establishStream(
 		endpoint: String,
 		headers: [String: String],
 		inputStream: AsyncStream<Data>
 	) async throws -> AsyncThrowingStream<AssistantSDK.NetworkStreamingOutputEvent, any Error> {
-		guard let url = URL(string: endpoint) else {
-			throw URLError(.badURL)
-		}
+		let url = try Self.validate(endpoint: endpoint)
 
 		// Вытеснение: помечается токен текущего владельца — живого стрима или
 		// вызова в окне кук. Глобальной бухгалтерии нет: токен умирает вместе
@@ -118,9 +142,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		let lifecycleToken = LifecycleToken()
 		currentToken = lifecycleToken
 
-		// Буфер выходного стрима unbounded: потребитель голосового стрима
-		// обязан поспевать, backpressure не применяется намеренно
-		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
+		let (outputStream, outputContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>
+			.makeStream(bufferingPolicy: .bufferingOldest(Self.outputBufferDepth))
 		let (delegateStream, delegateContinuation) = AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.makeStream()
 
 		outputContinuation.onTermination = { [weak self] _ in
@@ -129,6 +152,12 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 		var request = URLRequest(url: url)
 		for (key, value) in headers {
+			guard Self.isValidHeaderName(key), Self.isValidHeaderValue(value) else {
+				// Такую пару Foundation отбрасывает целиком и молча — без лога
+				// заголовка просто не окажется на проводе, и это никак не видно
+				Logger.assistant.error(S("Header rejected: \(key)"))
+				continue
+			}
 			request.setValue(value, forHTTPHeaderField: key)
 		}
 
@@ -139,6 +168,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// токену: вытеснение — CancellationError (ретрай-логика не должна
 			// путать замену со штатным закрытием), явная отмена — тихий finish,
 			// единый с контрактом поднятого стрима
+			outputContinuation.onTermination = nil
 			if lifecycleToken.superseded {
 				outputContinuation.finish(throwing: CancellationError())
 			} else {
@@ -148,30 +178,29 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			return outputStream
 		}
 
-		// Условный сброс: invalidate(), успевший в окно сбора кук, уже
-		// скоммитил .disarmed — затирать его значило бы взвести страховку,
-		// которую вызывающий только что снял
-		if timeoutArbitration != .disarmed {
-			timeoutArbitration = .pending
-		}
-		let delegate = WebSocketNetworkStreamingDelegate(continuation: delegateContinuation)
+		let delegate = WebSocketNetworkStreamingDelegate(origin: url, continuation: delegateContinuation)
 		let task = session.webSocketTask(with: request)
+		task.maximumMessageSize = Self.maximumMessageSize
 		webSocketTask = task
 		task.delegate = delegate
 		task.resume()
 
-		let timeoutSeconds = UInt64(timeout)
-		timer = Task { [weak self] in
-			try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-			if Task.isCancelled { return }
-			// Проверка «был ли первый байт» и финиш — одним изолированным
-			// шагом: разнесённые check и act оставляли окно, где .timeout
-			// перебивал уже принятое сообщение
-			await self?.fireTimeout(
-				generation: currentGeneration,
-				outputContinuation: outputContinuation,
-				delegateContinuation: delegateContinuation
-			)
+		// Страховка могла быть снята вызовом invalidate() в окне сбора кук —
+		// тогда таймер не заводится вовсе
+		if isTimeoutArmed {
+			let timeoutSeconds = UInt64(timeout)
+			timer = Task { [weak self] in
+				try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+				if Task.isCancelled { return }
+				// Проверка «был ли первый байт» и финиш — одним изолированным
+				// шагом: разнесённые check и act оставляли окно, где .timeout
+				// перебивал уже принятое сообщение
+				await self?.fireTimeout(
+					generation: currentGeneration,
+					outputContinuation: outputContinuation,
+					delegateContinuation: delegateContinuation
+				)
+			}
 		}
 
 		createConnectTask(
@@ -187,23 +216,58 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return outputStream
 	}
 
-	/// Закрывает вебсокет-соединение и отменяет его задачи. Уже буферизованный
-	/// платформой хвост входящих может быть доставлен до финиша.
+	/// Закрывает ТЕКУЩЕЕ соединение актора и отменяет его задачи; стрим
+	/// завершается тихим `finish()`. Идентичности у стримов нет — сигнатура
+	/// унаследована от протокола, — поэтому вызов, разошедшийся с новым
+	/// `establishStream`, закроет уже новый стрим, и тот финиширует, не отдав
+	/// ни одного события; вызывающему стоит упорядочивать отмену и переподъём.
+	/// Уже буферизованный платформой хвост входящих может быть доставлен до финиша.
 	func cancel() async {
 		cancel(generation: generation)
 	}
 
-	/// Останавливает таймер таймаута текущего поколения. Снимает единственную
-	/// страховку от зависшего рукопожатия: дальше дедлайнами управляет вызывающий.
+	// MARK: - Deadline Control
+
+	/// Снимает дедлайн ожидания первого входящего сообщения. Дедлайн тикает и
+	/// после `.connected`, так что это единственный способ держать долго
+	/// молчащее соединение открытым; дальше дедлайнами управляет вызывающий.
+	/// В протокол `NetworkStreaming` не входит — доступен по конкретному типу.
 	func invalidate() {
-		// Коммит разоружения — в том же изолированном шаге: отмена одного лишь
-		// хэндла оставляла окно в один хоп, где уже проснувшийся таймер
+		// Разоружение коммитится в том же изолированном шаге, что и отмена
+		// хэндла: иначе оставалось окно в один хоп, где уже проснувшийся таймер
 		// добегал до fireTimeout и рвал стрим после явного invalidate()
-		if timeoutArbitration == .pending {
-			timeoutArbitration = .disarmed
-		}
+		isTimeoutArmed = false
 		timer?.cancel()
 		timer = nil
+	}
+
+	// MARK: - Endpoint Validation
+
+	/// Отбраковывает endpoint до любого teardown'а.
+	/// - `.badURL` — строка не разобралась либо в ней нет схемы или хоста.
+	/// - `.appTransportSecurityRequiresSecureConnection` — транспорт без TLS вне
+	///   loopback: SDK-куки ушли бы открытым текстом и достались бы любому на пути.
+	private static func validate(endpoint: String) throws -> URL {
+		guard let url = URL(string: endpoint),
+			  let scheme = url.scheme?.lowercased(),
+			  let host = url.host,
+			  host.isEmpty == false else {
+			throw URLError(.badURL)
+		}
+		guard scheme == "wss" || scheme == "https" || isLoopback(host: host) else {
+			Logger.assistant.error(S("Insecure endpoint rejected: \(scheme)"))
+			throw URLError(.appTransportSecurityRequiresSecureConnection)
+		}
+		return url
+	}
+
+	private static func isLoopback(host: String) -> Bool {
+		switch host.lowercased() {
+		case "127.0.0.1", "localhost", "::1", "[::1]":
+			return true
+		default:
+			return false
+		}
 	}
 
 	// MARK: - Private Methods
@@ -218,6 +282,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		closeCode: URLSessionWebSocketTask.CloseCode = .normalClosure
 	) {
 		guard requested == generation else { return }
+		// Причина фиксируется на токене до того, как он потеряется: connectTask
+		// отличит явную отмену (тихий finish) от гонки с терминальным событием
+		currentToken?.cancelled = true
 		// Отмена ввода — до разрыва сокета: inflight-send иначе падал от
 		// разрыва раньше, чем задача видела отмену, и штатный teardown
 		// эскалировался как сбой аплинка
@@ -225,9 +292,9 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		inputTask = nil
 		webSocketTask?.cancel(with: closeCode, reason: nil)
 		webSocketTask = nil
-		// Время жизни арбитража совпадает с остальными слотами: иначе
+		// Страховка живёт ровно столько же, сколько остальные слоты: иначе
 		// унаследованное состояние блокировало бы invalidate() в окне кук
-		timeoutArbitration = .pending
+		isTimeoutArmed = true
 		outputTask?.cancel()
 		outputTask = nil
 		connectTask?.cancel()
@@ -253,17 +320,17 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		return true
 	}
 
-	/// Изоляционный шлюз: connectTask читает флаг токена снаружи изоляции,
+	/// Изоляционный шлюз: connectTask читает флаги токена снаружи изоляции,
 	/// а дисциплина @unchecked требует все обращения вести через актора.
-	private func isSuperseded(_ token: LifecycleToken) -> Bool {
-		token.superseded
+	private func outcome(for token: LifecycleToken) -> (superseded: Bool, cancelled: Bool) {
+		(token.superseded, token.cancelled)
 	}
 
 	private func acceptFirstMessage(generation requested: Int) -> Bool {
-		// Байт принимается из любого состояния, кроме проигранного арбитража:
-		// .disarmed означает «страховка снята», а не «стрим мёртв»
-		guard requested == generation, timeoutArbitration != .timedOut else { return false }
-		timeoutArbitration = .firstMessage
+		// Опоздавший байт отсекает поколение: fireTimeout двигает его в том же
+		// изолированном шаге, что и решение о таймауте
+		guard requested == generation else { return false }
+		isTimeoutArmed = false
 		timer?.cancel()
 		timer = nil
 		return true
@@ -274,8 +341,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation,
 		delegateContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 	) {
-		guard requested == generation, timeoutArbitration == .pending else { return }
-		timeoutArbitration = .timedOut
+		guard requested == generation, isTimeoutArmed else { return }
 		// Снимаем onTermination: его Task с cancel(.normalClosure) гонялся бы
 		// с нашим teardown и мог перебить close-код .goingAway
 		outputContinuation.onTermination = nil
@@ -309,21 +375,30 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 					// Причина фиксируется до отмены сокета (паттерн fireTimeout):
 					// гонка didClose/didComplete не подменит семантику, потребитель
 					// получит транспортную ошибку, а не «сервер договорил»
-					delegateContinuation.finish(throwing: NetworkStreamingError.nsError(error as NSError))
+					delegateContinuation.finish(
+						throwing: NetworkStreamingError.uplinkFailure(error as NSError)
+					)
 					task.cancel(with: .goingAway, reason: nil)
 				}
 			}
 			guard Task.isCancelled == false, sendFailed == false else { return }
 			Logger.assistant.info(S("Input stream finished"))
-			try? await task.send(.data(Self.inputTerminator))
+			do {
+				try await task.send(.data(Self.inputTerminator))
+			} catch {
+				// Терминальное событие уже едет к потребителю через делегата —
+				// здесь нужен лишь след в логе, что конец ввода не доехал
+				Logger.assistant.error(S("WebSocket input terminator send failed"))
+			}
 		}
 	}
 
+	/// Заводит читателя и отдаёт сигнал его завершения; nil — поколение сдвинулось.
 	private func createOutputTask(
 		generation: Int,
 		task: URLSessionWebSocketTask,
 		outputContinuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
-	) -> (reader: Task<Void, Never>, done: AsyncStream<Void>)? {
+	) -> AsyncStream<Void>? {
 		// Хоп отменённой connectTask всё равно исполняется: без guard'а поздний
 		// вызов пересоздал бы задачи после teardown или затёр слоты нового
 		// поколения, оставив его живой inputTask без ссылки
@@ -368,7 +443,18 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 							return
 						}
 					}
-					outputContinuation.yield(.received(payload))
+					if case .dropped = outputContinuation.yield(.received(payload)) {
+						// Очередь переполнена: потребитель не вычитывает стрим
+						// либо сервер заливает быстрее, чем тот успевает. Молча
+						// терять кадры нельзя — стрим завершается ошибкой
+						Logger.assistant.error(S("Output buffer overflow: consumer is not draining"))
+						outputContinuation.finish(
+							throwing: NetworkStreamingError.nsError(
+								NSError(domain: NSURLErrorDomain, code: NSURLErrorDataLengthExceedsMaximum)
+							)
+						)
+						return
+					}
 				}
 			} catch {
 				// Терминальная ошибка чтения: завершение стрима — за connectTask,
@@ -376,7 +462,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			}
 		}
 		outputTask = reader
-		return (reader, done)
+		return done
 	}
 
 	private func createConnectTask(
@@ -396,9 +482,11 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			// ограничено гонкой «сигнал завершения читателя против дедлайна»:
 			// обе ветви группы отменяемы, группа не зависает. Патология
 			// (receive() не проснулся на закрытом сокете) оставляет висеть
-			// только сам читатель — минимально возможная цена
+			// только сам читатель — минимально возможная цена.
+			// На отменённых путях дренаж намеренно вырождается в no-op: тот же
+			// teardown отменил читателя строкой раньше, ждать уже нечего
 			func drainOutput() async {
-				guard let readerDone else { return }
+				guard let readerDone, Task.isCancelled == false else { return }
 				await withTaskGroup(of: Void.self) { group in
 					group.addTask { for await _ in readerDone {} }
 					group.addTask {
@@ -431,7 +519,7 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 							// потребитель, — ждём штатного финиша через delegateStream
 							continue
 						}
-						readerDone = created.done
+						readerDone = created
 						await self?.createInputTask(
 							generation: generation,
 							task: task,
@@ -444,11 +532,15 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 				terminalError = error
 			}
 			await drainOutput()
-			// Контракт вытеснения един для всех фаз и путей завершения:
-			// замена — CancellationError, даже если delegateStream успел
-			// бросить в той же гонке
-			if Task.isCancelled, await self?.isSuperseded(lifecycleToken) == true {
+			// Исход разрушенного стрима решает его инициатор, а не гонка с
+			// терминальным событием того же teardown'а: вытеснение —
+			// CancellationError, явная отмена — тихий finish. Терминальная
+			// ошибка остаётся исходом там, где стрим умер сам
+			let outcome = Task.isCancelled ? await self?.outcome(for: lifecycleToken) : nil
+			if outcome?.superseded == true {
 				outputContinuation.finish(throwing: CancellationError())
+			} else if outcome?.cancelled == true {
+				outputContinuation.finish()
 			} else if let terminalError {
 				outputContinuation.finish(throwing: terminalError)
 			} else {
@@ -462,14 +554,13 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 
 	// MARK: - Cookies
 
+	// Internal, а не private, ради адресных тестов на сборку куки и заголовка
 	func addCookies(to request: inout URLRequest, for url: URL) async {
-		// Куки прикрепляются к переданному endpoint как есть: он SDK-внутренний
-		// и доверенный. Cookie-заголовок вызывающего снимается безусловно —
-		// заголовком владеет только этот пайплайн.
-		// Авто-обработку отключаем: иначе URLSession может перетереть собранный
-		// вручную Cookie значениями из shared-стоража. ВАЖНО: это отключает и
-		// сохранение Set-Cookie из ответа на handshake — если бэк ротирует куки
-		// на рукопожатии, их нужно подхватывать отдельно
+		// Cookie-заголовок вызывающего снимается безусловно — заголовком владеет
+		// только этот пайплайн. Авто-обработку отключаем: иначе URLSession может
+		// перетереть собранный вручную Cookie значениями из shared-стоража.
+		// ВАЖНО: это отключает и сохранение Set-Cookie из ответа на handshake —
+		// если бэк ротирует куки на рукопожатии, их нужно подхватывать отдельно
 		request.httpShouldHandleCookies = false
 		request.setValue(nil, forHTTPHeaderField: "Cookie")
 
@@ -481,20 +572,32 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		var merged = [String: HTTPCookie]()
 
 		// Зарезервированные имена не берутся из shared вовсе: чужая кука
-		// хост-приложения не должна молча подменять авторизацию SDK.
-		// Одноимённые из стоража упорядочены по специфичности path —
-		// длинный path перекрывает короткий; порядок тотальный (при равной
-		// длине — лексикографический), sort в Swift нестабилен
-		let storedCookies = (handshakeCookieStorage?.cookies(for: cookieMatchURL(for: url)) ?? [])
+		// хост-приложения не должна молча подменять авторизацию SDK. Значения
+		// проверяются наравне со своими: requestHeaderFields склеивает пары через
+		// «; » без экранирования, поэтому ';' внутри чужого значения протаскивал
+		// бы в заголовок произвольные пары — включая повторный sessionid, который
+		// last-wins сервер и примет, то есть ровно в обход фильтра по имени.
+		// Одноимённые упорядочены по специфичности (домен, затем длина path):
+		// точечная кука перекрывает широкую. Порядок тотальный — sort нестабилен
+		let storedCookies = (handshakeCookieStorage?.cookies(for: Self.cookieMatchURL(for: url)) ?? [])
 			.filter { Self.reservedCookieNames.contains($0.name) == false }
-			.sorted { ($0.path.count, $0.path) < ($1.path.count, $1.path) }
+			.filter { Self.isSerializableCookie(name: $0.name, value: $0.value) }
+			.sorted {
+				($0.domain.count, $0.path.count, $0.path, $0.domain)
+					< ($1.domain.count, $1.path.count, $1.path, $1.domain)
+			}
 		for cookie in storedCookies {
 			merged[cookie.name] = cookie
 		}
 
 		for cookie in Cookies.allCases {
-			if let value = await cookieStorage.getCookie(name: cookie.rawValue),
-			   let outCookie = createCookie(name: cookie.rawValue, value: value, for: url) {
+			guard let value = await cookieStorage.getCookie(name: cookie.rawValue) else {
+				// Рукопожатие уйдёт без авторизации, и сервер закроет его сам —
+				// без этого лога причина отказа неотличима от серверной
+				Logger.assistant.error(S("Missing SDK cookie: \(cookie.rawValue)"))
+				continue
+			}
+			if let outCookie = createCookie(name: cookie.rawValue, value: value, for: url) {
 				merged[outCookie.name] = outCookie
 			}
 		}
@@ -509,7 +612,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 		}
 	}
 
-	private func cookieMatchURL(for url: URL) -> URL {
+	/// ws→http, wss→https: матчинг стоража и secure-куки работают по HTTP-схемам
+	static func cookieMatchURL(for url: URL) -> URL {
 		guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
 		switch components.scheme?.lowercased() {
 		case "ws": components.scheme = "http"
@@ -520,8 +624,8 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 	}
 
 	func createCookie(name: String, value: String, for url: URL) -> HTTPCookie? {
-		guard value.rangeOfCharacter(from: .controlCharacters) == nil, value.contains(";") == false else {
-			Logger.assistant.error(S("Cookie value rejected for \(name): control characters or separators"))
+		guard Self.isSerializableCookie(name: name, value: value) else {
+			Logger.assistant.error(S("Cookie rejected for \(name): control characters or separators"))
 			return nil
 		}
 		return HTTPCookie(properties: [
@@ -531,15 +635,71 @@ actor WebSocketNetworkStreaming: NetworkStreaming {
 			.domain: url.host ?? ""
 		])
 	}
+
+	/// Пара уходит в заголовок дословно, поэтому отсекаем всё, чем её можно
+	/// разорвать: CTL (C0 и DEL) плюс разделители самого Cookie-заголовка.
+	/// Категория Cf (U+FEFF, U+200B, мягкий перенос) намеренно разрешена —
+	/// заголовок ей не разорвать, а CharacterSet.controlCharacters забраковал
+	/// бы по ней валидный токен
+	private static func isSerializableCookie(name: String, value: String) -> Bool {
+		name.isEmpty == false && isCookieOctets(name) && isCookieOctets(value)
+	}
+
+	private static func isCookieOctets(_ text: String) -> Bool {
+		text.unicodeScalars.allSatisfy { scalar in
+			scalar.value >= 0x20 && scalar.value != 0x7F
+				&& scalar != ";" && scalar != "," && scalar != "="
+		}
+	}
+
+	// MARK: - Header Validation
+
+	/// RFC 7230 token: имя с управляющими символами Foundation принимает
+	/// дословно, поэтому отбраковываем его сами
+	private static func isValidHeaderName(_ name: String) -> Bool {
+		let separators = Set("()<>@,;:\\\"/[]?={} \t")
+		guard name.isEmpty == false else { return false }
+		return name.unicodeScalars.allSatisfy { scalar in
+			scalar.isASCII && scalar.value > 0x20 && scalar.value != 0x7F
+				&& separators.contains(Character(scalar)) == false
+		}
+	}
+
+	/// Значение с CR/LF/NUL Foundation отбрасывает вместе со всем заголовком —
+	/// молча. HTAB и пробел легальны
+	private static func isValidHeaderValue(_ value: String) -> Bool {
+		value.unicodeScalars.allSatisfy { scalar in
+			scalar.value == 0x09 || (scalar.value >= 0x20 && scalar.value != 0x7F)
+		}
+	}
+}
+
+// MARK: - NetworkStreamingError
+
+extension NetworkStreamingError {
+
+	/// Маппинг сбоя аплинка. Кейс потери соединения общий с делегатом: иначе
+	/// один и тот же обрыв давал бы .timeout или .nsError в зависимости от того,
+	/// кто заметил его первым — читатель или inflight-send. Ветка делегата
+	/// «POSIX 57 → чистый финиш» сюда не переносится: сбой отправки не должен
+	/// выглядеть как «сервер договорил»
+	static func uplinkFailure(_ error: NSError) -> NetworkStreamingError {
+		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
+			return .timeout
+		}
+		return .nsError(error)
+	}
 }
 
 // MARK: - WebSocketNetworkStreamingDelegate
 
 final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
 
+	private let origin: URL
 	private let continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation
 
-	init(continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation) {
+	init(origin: URL, continuation: AsyncThrowingStream<NetworkStreamingOutputEvent, Error>.Continuation) {
+		self.origin = origin
 		self.continuation = continuation
 	}
 
@@ -557,17 +717,44 @@ final class WebSocketNetworkStreamingDelegate: NSObject, URLSessionWebSocketDele
 		didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
 		reason: Data?
 	) {
-		guard closeCode != .normalClosure else {
-			continuation.finish()
+		guard Self.isCleanClosure(closeCode) else {
+			continuation.finish(throwing: NetworkStreamingError.closeCode(NetworkStreamingOutputError(code: closeCode)))
 			return
 		}
-		continuation.finish(throwing: NetworkStreamingError.closeCode(NetworkStreamingOutputError(code: closeCode)))
+		continuation.finish()
+	}
+
+	/// 1005 — «кода не было», легальный исход по RFC 6455 §7.1.5, а не сбой
+	static func isCleanClosure(_ closeCode: URLSessionWebSocketTask.CloseCode) -> Bool {
+		closeCode == .normalClosure || closeCode == .noStatusReceived
 	}
 }
 
 // MARK: - URLSessionTaskDelegate
 
 extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
+
+	/// Куки прикреплены к запросу статическим заголовком, поэтому per-host
+	/// скоупинг URLSession здесь не работает: редирект на чужой origin унёс бы
+	/// авторизацию SDK на хост, для которого она не выдавалась. Свой origin
+	/// пропускаем — это обычная смена пути
+	func urlSession(
+		_ session: URLSession,
+		task: URLSessionTask,
+		willPerformHTTPRedirection response: HTTPURLResponse,
+		newRequest request: URLRequest,
+		completionHandler: @escaping (URLRequest?) -> Void
+	) {
+		guard let target = request.url, isSameOrigin(target) else {
+			Logger.assistant.error(S("WebSocket handshake redirect refused"))
+			completionHandler(nil)
+			// Отказ сам по себе завершает задачу без ошибки, и стрим выглядел бы
+			// как штатно закрытый: причину фиксируем явно
+			continuation.finish(throwing: NetworkStreamingError.nsError(URLError(.unsupportedURL) as NSError))
+			return
+		}
+		completionHandler(request)
+	}
 
 	func urlSession(
 		_ session: URLSession,
@@ -592,9 +779,9 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 		}
 		if error.domain == NSPOSIXErrorDomain && error.code == Int(POSIXErrorCode.ENOTCONN.rawValue) {
 			// POSIX 57: сокет закрыт к моменту completion — финал гонки с
-			// close-фреймом (ветка из исходной версии файла). didCloseWith
-			// теряется безотносительно кода (замерено), код восстанавливаем
-			// из задачи. Истинные обрывы приходят NSURLError-кодами
+			// close-фреймом. didCloseWith теряется безотносительно кода
+			// (замерено), код восстанавливаем из задачи. Истинные обрывы
+			// приходят NSURLError-кодами
 			if let closeError = recoveredCloseError(from: task) {
 				continuation.finish(throwing: closeError)
 				return
@@ -603,19 +790,41 @@ extension WebSocketNetworkStreamingDelegate: URLSessionTaskDelegate {
 			return
 		}
 		if error.domain == NSURLErrorDomain && error.code == NSURLErrorNetworkConnectionLost {
-			// Маппинг из референсной реализации — унаследованный контракт SDK:
-			// потребители различают исходы по этим кейсам, менять только
-			// синхронно с вызывающим кодом
+			// Унаследованный контракт SDK: потребители различают исходы по этим
+			// кейсам, менять только синхронно с вызывающим кодом
 			continuation.finish(throwing: NetworkStreamingError.timeout)
 			return
 		}
 		continuation.finish(throwing: NetworkStreamingError.nsError(error))
 	}
 
+	private func isSameOrigin(_ target: URL) -> Bool {
+		let source = WebSocketNetworkStreaming.cookieMatchURL(for: origin)
+		let destination = WebSocketNetworkStreaming.cookieMatchURL(for: target)
+		guard let sourceScheme = source.scheme?.lowercased(),
+			  let destinationScheme = destination.scheme?.lowercased(),
+			  let sourceHost = source.host?.lowercased(),
+			  let destinationHost = destination.host?.lowercased() else {
+			return false
+		}
+		return sourceScheme == destinationScheme
+			&& sourceHost == destinationHost
+			&& Self.port(of: source) == Self.port(of: destination)
+	}
+
+	private static func port(of url: URL) -> Int? {
+		if let port = url.port { return port }
+		switch url.scheme?.lowercased() {
+		case "https": return 443
+		case "http": return 80
+		default: return nil
+		}
+	}
+
 	private func recoveredCloseError(from task: URLSessionTask) -> NetworkStreamingError? {
 		guard let webSocketTask = task as? URLSessionWebSocketTask else { return nil }
 		let closeCode = webSocketTask.closeCode
-		guard closeCode != .invalid && closeCode != .normalClosure else { return nil }
+		guard closeCode != .invalid, Self.isCleanClosure(closeCode) == false else { return nil }
 		return NetworkStreamingError.closeCode(NetworkStreamingOutputError(code: closeCode))
 	}
 }

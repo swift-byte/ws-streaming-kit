@@ -2,8 +2,6 @@ import asyncio, websockets
 
 LAST_CLOSE = {}
 
-LAST_CLOSE = {}
-
 async def handler(ws):
     path = ws.request.path
     try:
@@ -61,6 +59,16 @@ async def handler(ws):
         elif path == "/lastclose":
             await ws.send(str(LAST_CLOSE.get("code") or 0).encode())
             await asyncio.sleep(0.3)
+            await ws.close(code=1000)
+        elif path == "/headers":
+            hdrs = "\n".join(f"{k}: {v}" for k, v in ws.request.headers.raw_items())
+            await ws.send(hdrs.encode())
+            await asyncio.sleep(0.3)
+            await ws.close(code=1000)
+        elif path == "/flood":
+            for i in range(3000):
+                await ws.send(b"x" * 16)
+            await asyncio.sleep(10)
             await ws.close(code=1000)
         elif path == "/silent":
             await asyncio.sleep(30)
